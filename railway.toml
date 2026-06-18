@@ -1,0 +1,16 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python main.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+
+[[services]]
+name = "bot"
+startCommand = "python main.py"
+
+[[services]]
+name = "cron-checker"
+cronSchedule = "0 10 * * *"
+startCommand = "python -m scheduler.cron_checker"

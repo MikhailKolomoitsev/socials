@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Terms of Service — Socials Auto-Publisher{% endblock %}
+{% block content %}
+<h1>Terms of Service</h1>
+<p><em>Last updated: {{ updated }}</em></p>
+
+<p>Socials Auto-Publisher ("the App") is a personal, single-operator automation tool built and operated by Mykhailo Kolomoitsev ("the Operator"). It is not offered as a public service or made available for sign-up by third parties.</p>
+
+<h2>1. What the App does</h2>
+<p>The App lets the Operator send a video to a private Telegram bot. The App then automatically: removes silent segments from the video, generates subtitles via a speech-to-text service, burns the subtitles into the video, generates a cover image, stores the resulting files in cloud storage, and publishes the video to the Operator's own TikTok account. The following day, the App checks the view counts of videos published the prior day via the TikTok API and republishes only the best-performing video to the Operator's own Instagram account as a Reel.</p>
+
+<h2>2. Who can use the App</h2>
+<p>Access to the Telegram bot is restricted to a single, hardcoded Telegram user ID belonging to the Operator. No other person can submit content to the App or trigger publishing through it.</p>
+
+<h2>3. Accounts and authorization</h2>
+<p>The App connects to TikTok and Instagram using OAuth credentials issued directly to the Operator's own accounts on those platforms. The App does not request or store credentials for any other person's account.</p>
+
+<h2>4. Content responsibility</h2>
+<p>The Operator is solely responsible for the video content submitted to and published by the App, and for complying with the terms of service of TikTok, Instagram (Meta), and any other third-party platform the App publishes to.</p>
+
+<h2>5. No warranty</h2>
+<p>The App is provided "as is," without warranty of any kind. The Operator makes no guarantee of uptime, availability, or correctness of automated processing or publishing.</p>
+
+<h2>6. Changes</h2>
+<p>These Terms may be updated from time to time. Continued use of the App after changes are posted constitutes acceptance of the revised Terms.</p>
+
+<h2>7. Contact</h2>
+<p>Questions about these Terms can be sent to <a href="mailto:mihon.testosterone@gmail.com">mihon.testosterone@gmail.com</a>.</p>
+{% endblock %}

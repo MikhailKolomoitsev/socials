@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Privacy Policy — Socials Auto-Publisher{% endblock %}
+{% block content %}
+<h1>Privacy Policy</h1>
+<p><em>Last updated: {{ updated }}</em></p>
+
+<p>Socials Auto-Publisher ("the App") is a personal automation tool with a single operator, Mykhailo Kolomoitsev ("the Operator"). It is not a public product and does not collect data from, or about, any member of the public.</p>
+
+<h2>1. What data the App processes</h2>
+<ul>
+  <li><strong>Video files</strong> sent by the Operator via a private Telegram bot.</li>
+  <li><strong>Generated artifacts</strong>: subtitle files, processed video, and cover images derived from the submitted video.</li>
+  <li><strong>Transcript text</strong> produced by an automated speech-to-text service, used to generate subtitles and captions.</li>
+  <li><strong>Publishing metadata</strong>: timestamps, scheduling information, and view counts retrieved from the TikTok API.</li>
+</ul>
+<p>The App does not collect data from end viewers of the published videos, and does not process content from any user other than the Operator.</p>
+
+<h2>2. How data is stored</h2>
+<p>Processed video and cover files are stored in a private cloud storage bucket (Amazon S3 or a compatible provider) and referenced by URL when publishing to TikTok and Instagram. Publishing history and scheduling state are stored in a local database used only by the App.</p>
+
+<h2>3. Third-party services used</h2>
+<ul>
+  <li><strong>Telegram</strong> — for receiving video submissions from the Operator.</li>
+  <li><strong>OpenAI Whisper or AssemblyAI</strong> — for automated speech-to-text transcription.</li>
+  <li><strong>Amazon S3 (or compatible storage)</strong> — for temporary hosting of media files referenced during publishing.</li>
+  <li><strong>TikTok Content Posting API</strong> — for publishing videos and retrieving view counts on the Operator's own TikTok account.</li>
+  <li><strong>Instagram Graph API (Meta)</strong> — for publishing Reels to the Operator's own Instagram account.</li>
+</ul>
+<p>Each of these services processes data under its own privacy policy. The App only sends them the minimum data required to perform the requested action (e.g., the video file for transcription or publishing).</p>
+
+<h2>4. Data retention</h2>
+<p>Media files are retained in cloud storage and in the App's local database for as long as needed to support the publishing workflow and view-count comparison. The Operator can delete this data at any time.</p>
+
+<h2>5. Data sharing</h2>
+<p>The App does not sell, rent, or share data with any party other than the third-party services listed above, which are required to perform the App's core function.</p>
+
+<h2>6. Security</h2>
+<p>Access to the App is restricted to a single authorized Telegram user ID. API credentials are stored as environment variables and are not committed to source control.</p>
+
+<h2>7. Contact</h2>
+<p>Questions about this Privacy Policy can be sent to <a href="mailto:mihon.testosterone@gmail.com">mihon.testosterone@gmail.com</a>.</p>
+{% endblock %}

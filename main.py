@@ -38,6 +38,7 @@ from pipeline.transcriber import transcribe_to_srt
 from pipeline.cover_generator import generate_cover
 from pipeline.uploader import upload_file
 from scheduler.queue_runner import run as queue_runner_run
+from webapp.server import start_in_background as start_webapp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [BOT] %(message)s")
 logger = logging.getLogger(__name__)
@@ -215,6 +216,10 @@ def main():
     queue_thread = threading.Thread(target=queue_runner_run, daemon=True)
     queue_thread.start()
     logger.info("Queue runner запущено в фоні.")
+
+    # Запускаємо веб-сервер з /terms і /privacy (для TikTok App Review)
+    start_webapp()
+    logger.info("Веб-сервер (/terms, /privacy) запущено в фоні.")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 

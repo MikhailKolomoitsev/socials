@@ -19,8 +19,19 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 S3_PUBLIC_BASE_URL = os.getenv("S3_PUBLIC_BASE_URL")
 
 # TikTok
-TIKTOK_ACCESS_TOKEN = os.getenv("TIKTOK_ACCESS_TOKEN")
-TIKTOK_OPEN_ID = os.getenv("TIKTOK_OPEN_ID")
+TIKTOK_ACCESS_TOKEN = os.getenv("TIKTOK_ACCESS_TOKEN")  # fallback, якщо OAuth ще не пройдено
+TIKTOK_OPEN_ID = os.getenv("TIKTOK_OPEN_ID")             # fallback
+
+# TikTok Login Kit (OAuth) — для отримання access_token самостійно, без ручного копіювання
+TIKTOK_CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY")
+TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET")
+TIKTOK_REDIRECT_URI = os.getenv("TIKTOK_REDIRECT_URI")  # напр. https://<railway-domain>/auth/tiktok/callback
+
+# Секрет, що захищає /auth/tiktok/login від сторонніх — тільки оператор знає це значення
+ADMIN_SECRET = os.getenv("ADMIN_SECRET")
+
+# Ключ для підпису Flask-сесії (потрібен для state у OAuth-флоу)
+FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
 
 # Instagram
 INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN")

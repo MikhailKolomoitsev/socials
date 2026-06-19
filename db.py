@@ -37,6 +37,15 @@ def init_db():
                 best_of_day INTEGER DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS tiktok_tokens (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                open_id TEXT NOT NULL,
+                access_token TEXT NOT NULL,
+                refresh_token TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS publish_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 video_id INTEGER NOT NULL,
@@ -47,6 +56,34 @@ def init_db():
                 FOREIGN KEY (video_id) REFERENCES videos(id)
             );
         """)
+
+
+# ── TikTok OAuth tokens ──────────────────────────────────────────────────────
+
+def save_tiktok_tokens(open_id: str, access_token: str, refresh_token: str, expires_in: int):
+    """Зберігає (перезаписує) токени TikTok, отримані через OAuth. Один рядок — один оператор."""
+    from datetime import timedelta
+    expires_at = (datetime.now() + timedelta(seconds=expires_in)).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO tiktok_tokens (id, open_id, access_token, refresh_token, expires_at, updated_at)
+            VALUES (1, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET
+                open_id=excluded.open_id,
+                access_token=excluded.access_token,
+                refresh_token=excluded.refresh_token,
+                expires_at=excluded.expires_at,
+                updated_at=datetime('now')
+            """,
+            (open_id, access_token, refresh_token, expires_at),
+        )
+
+
+def get_tiktok_tokens() -> Optional[dict]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM tiktok_tokens WHERE id=1").fetchone()
+    return dict(row) if row else None
 
 
 # ── Videos ────────────────────────────────────────────────────────────────────

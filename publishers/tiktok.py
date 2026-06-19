@@ -6,10 +6,66 @@
 """
 
 import time
+from datetime import datetime
+
 import requests
-from config import TIKTOK_ACCESS_TOKEN, TIKTOK_OPEN_ID
+
+import db
+from config import (
+    TIKTOK_ACCESS_TOKEN,
+    TIKTOK_CLIENT_KEY,
+    TIKTOK_CLIENT_SECRET,
+)
 
 BASE_URL = "https://open.tiktokapis.com/v2"
+
+
+def get_valid_access_token() -> str:
+    """
+    Повертає актуальний access_token.
+
+    Пріоритет:
+      1. Токен, отриманий через Login Kit (OAuth) і збережений у БД —
+         автоматично оновлюється через refresh_token, якщо протермінований.
+      2. TIKTOK_ACCESS_TOKEN з .env — fallback для ручного тестування,
+         поки OAuth не пройдено.
+    """
+    tokens = db.get_tiktok_tokens()
+    if not tokens:
+        if not TIKTOK_ACCESS_TOKEN:
+            raise RuntimeError(
+                "Немає TikTok токена: пройди /auth/tiktok/login або задай TIKTOK_ACCESS_TOKEN."
+            )
+        return TIKTOK_ACCESS_TOKEN
+
+    expires_at = datetime.fromisoformat(tokens["expires_at"])
+    if datetime.now() < expires_at:
+        return tokens["access_token"]
+
+    # Токен протермінований — оновлюємо через refresh_token.
+    resp = requests.post(
+        "https://open.tiktokapis.com/v2/oauth/token/",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "client_key": TIKTOK_CLIENT_KEY,
+            "client_secret": TIKTOK_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": tokens["refresh_token"],
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "access_token" not in data:
+        raise RuntimeError(f"Не вдалось оновити TikTok токен: {data}")
+
+    db.save_tiktok_tokens(
+        open_id=data.get("open_id", tokens["open_id"]),
+        access_token=data["access_token"],
+        refresh_token=data.get("refresh_token", tokens["refresh_token"]),
+        expires_in=data.get("expires_in", 86400),
+    )
+    return data["access_token"]
 
 
 def publish_video(video_url: str, caption: str, cover_image_url: str = None) -> str:
@@ -25,7 +81,7 @@ def publish_video(video_url: str, caption: str, cover_image_url: str = None) -> 
         publish_id (TikTok video ID після публікації)
     """
     headers = {
-        "Authorization": f"Bearer {TIKTOK_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {get_valid_access_token()}",
         "Content-Type": "application/json; charset=UTF-8",
     }
 
@@ -74,7 +130,7 @@ def get_video_views(video_id: str) -> int:
         Кількість переглядів
     """
     headers = {
-        "Authorization": f"Bearer {TIKTOK_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {get_valid_access_token()}",
         "Content-Type": "application/json",
     }
 

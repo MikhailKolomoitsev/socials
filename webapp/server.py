@@ -30,7 +30,7 @@ app.secret_key = FLASK_SECRET_KEY
 
 UPDATED = date.today().isoformat()
 
-TIKTOK_SCOPES = "user.info.basic,video.upload,video.publish"
+TIKTOK_SCOPES = "user.info.basic,video.upload"
 
 
 @app.route("/")

@@ -33,6 +33,19 @@ def privacy():
     return render_template("privacy.html", updated=UPDATED)
 
 
+# TikTok "URL prefix" domain-ownership verification (signature file).
+# Файл згенерований у TikTok Developer Portal при верифікації
+# https://socials-production-8407.up.railway.app/ — вміст і ім'я фіксовані,
+# не редагувати без повторної верифікації в TikTok.
+@app.route("/tiktok4cSW6AEjMjrLwqedFZtbDoIXo7fI36rL.txt")
+def tiktok_site_verification():
+    return (
+        "tiktok-developers-site-verification=4cSW6AEjMjrLwqedFZtbDoIXo7fI36rL",
+        200,
+        {"Content-Type": "text/plain"},
+    )
+
+
 def run():
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)

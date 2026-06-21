@@ -1,8 +1,14 @@
 """
 Публікація відео в TikTok через Content Posting API v2.
-Документація: https://developers.tiktok.com/doc/content-posting-api-get-started
+Документація: https://developers.tiktok.com/doc/content-posting-api-get-started-upload-content
 
-Потрібні scopes: video.upload, video.publish
+Без App Review (без аудиту) TikTok дозволяє лише "draft upload" —
+відео потрапляє у вхідні (inbox) акаунта, і власник має сам відкрити
+сповіщення і натиснути "Опублікувати" в самому TikTok. Це навмисний
+вибір (без публічного, погодженого додатку): жодного автопостингу
+від імені TikTok, тільки доставка в чернетки.
+
+Потрібен лише scope: video.upload
 """
 
 import time
@@ -70,15 +76,24 @@ def get_valid_access_token() -> str:
 
 def publish_video(video_url: str, caption: str, cover_image_url: str = None) -> str:
     """
-    Публікує відео в TikTok через URL (server-side posting).
+    Закидає відео в TikTok "чернетки" (inbox draft upload) через URL.
+
+    Це НЕ автопостинг: TikTok надішле власнику акаунта сповіщення,
+    і він має сам відкрити TikTok і натиснути "Опублікувати". Це
+    свідомий вибір, щоб не проходити повний App Review (Direct Post
+    API вимагає аудиту і не призначений для особистих/непублічних
+    застосунків).
 
     Args:
         video_url: публічний URL відео (S3)
-        caption: підпис до відео (макс. 2200 символів)
-        cover_image_url: публічний URL обкладинки (опційно)
+        caption: підпис до відео (тут не використовується TikTok'ом —
+                 inbox-флоу не приймає title/опис, власник дописує
+                 підпис сам у застосунку перед публікацією)
+        cover_image_url: не використовується inbox-флоу (залишено
+                 для сумісності викликів)
 
     Returns:
-        publish_id (TikTok video ID після публікації)
+        publish_id (ідентифікатор завдання на завантаження в TikTok)
     """
     headers = {
         "Authorization": f"Bearer {get_valid_access_token()}",
@@ -86,25 +101,14 @@ def publish_video(video_url: str, caption: str, cover_image_url: str = None) -> 
     }
 
     body = {
-        "post_info": {
-            "title": caption[:2200],
-            "privacy_level": "PUBLIC_TO_EVERYONE",
-            "disable_duet": False,
-            "disable_comment": False,
-            "disable_stitch": False,
-            "video_cover_timestamp_ms": 1000,
-        },
         "source_info": {
             "source": "PULL_FROM_URL",
             "video_url": video_url,
         },
     }
 
-    if cover_image_url:
-        body["post_info"]["cover_image_url"] = cover_image_url
-
     resp = requests.post(
-        f"{BASE_URL}/post/publish/video/init/",
+        f"{BASE_URL}/post/publish/inbox/video/init/",
         headers=headers,
         json=body,
         timeout=30,
@@ -154,7 +158,14 @@ def get_video_views(video_id: str) -> int:
 
 
 def _wait_for_publish(publish_id: str, headers: dict, max_retries: int = 10) -> str:
-    """Чекає поки TikTok обробить відео і повертає video_id."""
+    """
+    Чекає поки TikTok обробить відео і завантажить його у "чернетки".
+
+    Для inbox-флоу (без App Review) PUBLISH_COMPLETE означає лише, що
+    відео успішно дійшло до вхідних TikTok-акаунта — НЕ що його вже
+    опубліковано. "publicaly_available_post_id" тут відсутній, бо
+    публікацію довершує сам власник вручну в застосунку TikTok.
+    """
     for attempt in range(max_retries):
         resp = requests.post(
             f"{BASE_URL}/post/publish/status/fetch/",
@@ -167,7 +178,8 @@ def _wait_for_publish(publish_id: str, headers: dict, max_retries: int = 10) -> 
         status = data.get("data", {}).get("status")
 
         if status == "PUBLISH_COMPLETE":
-            return data["data"].get("publicaly_available_post_id", [publish_id])[0]
+            post_ids = data["data"].get("publicaly_available_post_id")
+            return post_ids[0] if post_ids else publish_id
         elif status in ("FAILED", "CANCELLED"):
             raise RuntimeError(f"TikTok publish failed: {data}")
 

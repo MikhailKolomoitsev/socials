@@ -36,7 +36,7 @@ def _transcribe_whisper(video_path: str) -> tuple[str, str]:
             model="whisper-1",
             file=f,
             response_format="verbose_json",
-            timestamp_granularities=["word"],
+            timestamp_granularities=["segment"],
         )
 
     segments = response.segments or []
@@ -88,11 +88,15 @@ def _assemblyai_to_srt(transcript) -> str:
 # ── Утиліти ───────────────────────────────────────────────────────────────────
 
 def _segments_to_srt(segments: list) -> str:
+    """
+    segments — список об'єктів TranscriptionSegment (pydantic) з SDK openai,
+    не dict-ів, тому атрибути читаємо через getattr, а не .get().
+    """
     lines = []
     for i, seg in enumerate(segments, start=1):
-        start = _seconds_to_srt_time(seg.get("start", 0))
-        end = _seconds_to_srt_time(seg.get("end", 0))
-        text = seg.get("text", "").strip()
+        start = _seconds_to_srt_time(getattr(seg, "start", 0) or 0)
+        end = _seconds_to_srt_time(getattr(seg, "end", 0) or 0)
+        text = (getattr(seg, "text", "") or "").strip()
         lines.append(f"{i}\n{start} --> {end}\n{text}\n")
     return "\n".join(lines)
 

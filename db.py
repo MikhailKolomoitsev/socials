@@ -1,8 +1,11 @@
+import os
 import sqlite3
 from datetime import datetime, date
 from typing import Optional
 
-DB_PATH = "socials.db"
+# DB_PATH задається через env (Railway Volume mount path, напр. /data/socials.db),
+# щоб база не зникала при кожному редеплої. Без env — локальний файл поруч з кодом.
+DB_PATH = os.getenv("DB_PATH", "socials.db")
 
 
 def get_conn():

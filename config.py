@@ -11,12 +11,15 @@ TELEGRAM_ALLOWED_USER_ID = int(os.getenv("TELEGRAM_ALLOWED_USER_ID", "0"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 
-# S3
+# S3 (або Cloudflare R2 — S3-сумісне; тоді задай S3_ENDPOINT_URL)
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_REGION = os.getenv("S3_REGION", "eu-central-1")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 S3_PUBLIC_BASE_URL = os.getenv("S3_PUBLIC_BASE_URL")
+# Для Cloudflare R2: https://<account_id>.r2.cloudflarestorage.com
+# Для звичайного AWS S3 лишити порожнім.
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
 
 # TikTok
 TIKTOK_ACCESS_TOKEN = os.getenv("TIKTOK_ACCESS_TOKEN")  # fallback, якщо OAuth ще не пройдено

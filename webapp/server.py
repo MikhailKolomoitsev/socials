@@ -21,6 +21,9 @@ from config import (
     TIKTOK_CLIENT_KEY,
     TIKTOK_CLIENT_SECRET,
     TIKTOK_REDIRECT_URI,
+    INSTAGRAM_CLIENT_ID,
+    INSTAGRAM_CLIENT_SECRET,
+    INSTAGRAM_REDIRECT_URI,
     ADMIN_SECRET,
     FLASK_SECRET_KEY,
 )
@@ -31,6 +34,10 @@ app.secret_key = FLASK_SECRET_KEY
 UPDATED = date.today().isoformat()
 
 TIKTOK_SCOPES = "user.info.basic,video.upload"
+
+# Instagram API with Instagram Login (Business Login) — заміна старих
+# instagram_basic/instagram_content_publish (deprecated 27.01.2025).
+INSTAGRAM_SCOPES = "instagram_business_basic,instagram_business_content_publish"
 
 
 @app.route("/")
@@ -122,6 +129,108 @@ def tiktok_callback():
         f"open_id: {data['open_id']}<br>"
         "Токен збережено, можеш закрити цю сторінку — бот тепер публікуватиме "
         "від імені цього акаунта.",
+        200,
+    )
+
+
+# ── Instagram API with Instagram Login (Business Login, OAuth) ─────────────
+# Аналог TikTok Login Kit вище: оператор сам авторизує застосунок зі своїм
+# Instagram-акаунтом (Business), і ми отримуємо long-lived access_token
+# (60 днів), який потім сам оновлюється через graph.instagram.com/refresh_access_token.
+# Документація: https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/business-login/
+
+@app.route("/auth/instagram/login")
+def instagram_login():
+    if not ADMIN_SECRET or request.args.get("key") != ADMIN_SECRET:
+        abort(403)
+
+    if not INSTAGRAM_CLIENT_ID or not INSTAGRAM_REDIRECT_URI:
+        return (
+            "INSTAGRAM_CLIENT_ID / INSTAGRAM_REDIRECT_URI не задані в змінних середовища.",
+            500,
+        )
+
+    state = secrets.token_urlsafe(16)
+    session["instagram_oauth_state"] = state
+
+    params = {
+        "client_id": INSTAGRAM_CLIENT_ID,
+        "redirect_uri": INSTAGRAM_REDIRECT_URI,
+        "response_type": "code",
+        "scope": INSTAGRAM_SCOPES,
+        "state": state,
+    }
+    return redirect("https://www.instagram.com/oauth/authorize?" + urlencode(params))
+
+
+@app.route("/auth/instagram/callback")
+def instagram_callback():
+    error = request.args.get("error")
+    if error:
+        return (
+            f"❌ Instagram відхилив авторизацію: {error} — "
+            f"{request.args.get('error_description', '')}",
+            400,
+        )
+
+    code = request.args.get("code")
+    state = request.args.get("state")
+    if not code or state != session.pop("instagram_oauth_state", None):
+        abort(400, "Невалідний state або відсутній code — почни авторизацію знову.")
+
+    # Instagram любить дописувати "#_" в кінці code, якщо його скопіювали з URL вручну —
+    # тут code приходить чистим через query string, але про всяк випадок підчищаємо.
+    code = code.split("#")[0]
+
+    # Крок 1: обмінюємо authorization code на short-lived access_token.
+    resp = requests.post(
+        "https://api.instagram.com/oauth/access_token",
+        data={
+            "client_id": INSTAGRAM_CLIENT_ID,
+            "client_secret": INSTAGRAM_CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "redirect_uri": INSTAGRAM_REDIRECT_URI,
+            "code": code,
+        },
+        timeout=15,
+    )
+    short_data = resp.json()
+
+    # Відповідь буває або {"data":[{...}]}, або плоским об'єктом — обробляємо обидва варіанти.
+    if isinstance(short_data, dict) and "data" in short_data:
+        short_data = short_data["data"][0]
+
+    short_token = short_data.get("access_token")
+    ig_user_id = short_data.get("user_id")
+    if not short_token or not ig_user_id:
+        return (f"❌ Не вдалось отримати short-lived токен від Instagram: {short_data}", 400)
+
+    # Крок 2: обмінюємо short-lived токен на long-lived (60 днів).
+    resp = requests.get(
+        "https://graph.instagram.com/access_token",
+        params={
+            "grant_type": "ig_exchange_token",
+            "client_secret": INSTAGRAM_CLIENT_SECRET,
+            "access_token": short_token,
+        },
+        timeout=15,
+    )
+    long_data = resp.json()
+
+    if "access_token" not in long_data:
+        return (f"❌ Не вдалось обміняти токен на long-lived: {long_data}", 400)
+
+    db.save_instagram_tokens(
+        ig_user_id=str(ig_user_id),
+        access_token=long_data["access_token"],
+        expires_in=long_data.get("expires_in", 5184000),  # 60 днів за замовчуванням
+    )
+
+    return (
+        "✅ Instagram-акаунт підключено успішно.<br>"
+        f"ig_user_id: {ig_user_id}<br>"
+        "Токен збережено (дійсний 60 днів, оновлюється автоматично) — можеш "
+        "закрити цю сторінку.",
         200,
     )
 

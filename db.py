@@ -46,6 +46,14 @@ def init_db():
                 updated_at TEXT DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS instagram_tokens (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                ig_user_id TEXT NOT NULL,
+                access_token TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS publish_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 video_id INTEGER NOT NULL,
@@ -83,6 +91,33 @@ def save_tiktok_tokens(open_id: str, access_token: str, refresh_token: str, expi
 def get_tiktok_tokens() -> Optional[dict]:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM tiktok_tokens WHERE id=1").fetchone()
+    return dict(row) if row else None
+
+
+# ── Instagram OAuth tokens (Business Login for Instagram) ───────────────────
+
+def save_instagram_tokens(ig_user_id: str, access_token: str, expires_in: int):
+    """Зберігає (перезаписує) long-lived токен Instagram. Один рядок — один оператор."""
+    from datetime import timedelta
+    expires_at = (datetime.now() + timedelta(seconds=expires_in)).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO instagram_tokens (id, ig_user_id, access_token, expires_at, updated_at)
+            VALUES (1, ?, ?, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET
+                ig_user_id=excluded.ig_user_id,
+                access_token=excluded.access_token,
+                expires_at=excluded.expires_at,
+                updated_at=datetime('now')
+            """,
+            (ig_user_id, access_token, expires_at),
+        )
+
+
+def get_instagram_tokens() -> Optional[dict]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM instagram_tokens WHERE id=1").fetchone()
     return dict(row) if row else None
 
 
@@ -124,7 +159,12 @@ def mark_best_of_day(video_id: int):
 
 
 def get_yesterdays_tiktoks():
-    """Повертає відео, опубліковані в TikTok вчора, без Instagram публікації."""
+    """Повертає відео, опубліковані в TikTok вчора, без Instagram публікації.
+
+    Застаріле: використовувалось автоматичним cron_checker.py, який читав
+    перегляди через get_video_views(). Більше не надійне, бо TikTok-відео
+    тепер публікується вручну власником (inbox-флоу), а не одразу й публічно.
+    """
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT * FROM videos
@@ -133,6 +173,29 @@ def get_yesterdays_tiktoks():
               AND instagram_media_id IS NULL
         """).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_recent_tiktoks_for_instagram(limit: int = 10):
+    """Останні відео, закинуті в TikTok (inbox) і ще не опубліковані в Instagram.
+
+    Використовується Telegram-командою "опублікувати в Instagram": власник сам
+    дивиться, яке відео "вибухнуло" в TikTok, і вибирає його зі списку тут.
+    """
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM videos
+            WHERE tiktok_video_id IS NOT NULL
+              AND instagram_media_id IS NULL
+            ORDER BY tiktok_published_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_video_by_id(video_id: int) -> Optional[dict]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
+    return dict(row) if row else None
 
 
 # ── Queue ─────────────────────────────────────────────────────────────────────

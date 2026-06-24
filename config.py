@@ -33,9 +33,17 @@ ADMIN_SECRET = os.getenv("ADMIN_SECRET")
 # Ключ для підпису Flask-сесії (потрібен для state у OAuth-флоу)
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
 
-# Instagram
+# Instagram (старий статичний токен — fallback, поки OAuth не пройдено)
 INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN")
 INSTAGRAM_BUSINESS_ACCOUNT_ID = os.getenv("INSTAGRAM_BUSINESS_ACCOUNT_ID")
+
+# Instagram API with Instagram Login (Business Login) — OAuth, аналог TikTok Login Kit.
+# Instagram App ID / App Secret беруться з Meta App Dashboard:
+# App Dashboard > Instagram > API setup with Instagram login > 3. Set up Instagram
+# business login > Business login settings.
+INSTAGRAM_CLIENT_ID = os.getenv("INSTAGRAM_CLIENT_ID")
+INSTAGRAM_CLIENT_SECRET = os.getenv("INSTAGRAM_CLIENT_SECRET")
+INSTAGRAM_REDIRECT_URI = os.getenv("INSTAGRAM_REDIRECT_URI")  # напр. https://<railway-domain>/auth/instagram/callback
 
 # Логіка публікацій
 TIKTOK_DAILY_LIMIT = int(os.getenv("TIKTOK_DAILY_LIMIT", "3"))

@@ -39,6 +39,7 @@ from pipeline.cover_generator import generate_cover
 from pipeline.uploader import upload_file
 from scheduler.queue_runner import run as queue_runner_run
 from webapp.server import start_in_background as start_webapp
+from publishers.instagram import publish_reel, adapt_caption_for_instagram
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [BOT] %(message)s")
 logger = logging.getLogger(__name__)
@@ -58,7 +59,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привіт! Надішли відео — я його оброблю і поставлю в чергу для публікації.\n\n"
         "/status — статус сьогоднішніх публікацій\n"
-        "/queue — черга"
+        "/queue — черга\n"
+        "/publish_ig — опублікувати в Instagram відео, яке вже \"вибухнуло\" в TikTok"
     )
 
 
@@ -80,6 +82,66 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = [f"• {i['platform']} о {i['scheduled_at'][:16]}" for i in items]
     await update.message.reply_text("📅 Черга:\n" + "\n".join(lines))
+
+
+async def cmd_publish_ig(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ручна заміна автоматичної "найкращий TikTok за вчора → Instagram".
+
+    TikTok-відео тепер публікується вручну власником (inbox-флоу), тож
+    переглядів через API не отримати поки відео не опубліковане публічно.
+    Натомість власник сам каже боту, яке відео "вибухнуло".
+    """
+    if not is_allowed(update):
+        return
+
+    videos = db.get_recent_tiktoks_for_instagram(limit=10)
+    if not videos:
+        await update.message.reply_text(
+            "Немає відео, закинутих у TikTok, які ще не опубліковані в Instagram."
+        )
+        return
+
+    buttons = []
+    for v in videos:
+        caption_preview = (v.get("tiktok_caption") or "").strip().replace("\n", " ")[:30]
+        published = (v.get("tiktok_published_at") or "")[:16]
+        label = f"{published} — {caption_preview or 'без підпису'}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"publish_ig:{v['id']}")])
+
+    await update.message.reply_text(
+        "Яке відео опублікувати в Instagram Reels?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def handle_publish_ig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_allowed(update):
+        return
+
+    video_id = int(query.data.split(":", 1)[1])
+    video = db.get_video_by_id(video_id)
+    if not video:
+        await query.edit_message_text("❌ Відео не знайдено.")
+        return
+
+    await query.edit_message_text("⏳ Публікую в Instagram Reels...")
+
+    insta_caption = adapt_caption_for_instagram(video.get("tiktok_caption", ""))
+    try:
+        media_id = publish_reel(
+            video_url=video["s3_url"],
+            caption=insta_caption,
+            cover_url=video.get("cover_s3_url"),
+        )
+        db.set_instagram_published(video_id, media_id, insta_caption)
+        await query.edit_message_text(f"✅ Опубліковано в Instagram Reels (media_id={media_id}).")
+    except Exception as e:
+        logger.error(f"Помилка публікації в Instagram: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Помилка публікації в Instagram: {e}")
 
 
 # ── Обробка відео ─────────────────────────────────────────────────────────────
@@ -203,7 +265,9 @@ async def handle_schedule_callback(update: Update, context: ContextTypes.DEFAULT
 
     await query.edit_message_text(
         f"✅ Поставлено в чергу на TikTok о {label}.\n"
-        f"Завтра о {TIKTOK_PUBLISH_TIMES[0]} перевірю перегляди і опублікую найкраще в Instagram Reels."
+        "Відео потрапить у твої TikTok-чернетки — відкрий TikTok і натисни "
+        "\"Опублікувати\". Коли побачиш, що відео вибухнуло, скористайся "
+        "командою /publish_ig, щоб закинути його ще й в Instagram Reels."
     )
 
 
@@ -226,8 +290,10 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("queue", cmd_queue))
+    app.add_handler(CommandHandler("publish_ig", cmd_publish_ig))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(CallbackQueryHandler(handle_schedule_callback, pattern=r"^schedule_tiktok:"))
+    app.add_handler(CallbackQueryHandler(handle_publish_ig_callback, pattern=r"^publish_ig:"))
 
     logger.info("Бот запущено. Очікую відео...")
     app.run_polling(drop_pending_updates=True)

@@ -33,7 +33,7 @@ from telegram.ext import (
 
 import db
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, TMP_DIR, TIKTOK_PUBLISH_TIMES, TIKTOK_DAILY_LIMIT
-from pipeline.ffmpeg_processor import remove_silence, burn_subtitles, extract_frame
+from pipeline.ffmpeg_processor import remove_silence, normalize_vertical, burn_subtitles, extract_frame
 from pipeline.transcriber import transcribe_to_srt
 from pipeline.cover_generator import generate_cover
 from pipeline.uploader import upload_file
@@ -169,6 +169,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # і з часом можуть забити диск (ENOSPC), що проявляється дивними
     # помилками типу "Unable to open ...srt" в зовсім інших місцях пайплайну.
     no_silence_path = None
+    vertical_path = None
     srt_path = None
     final_video_path = None
     frame_path = None
@@ -179,11 +180,18 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("✂️ Видаляю паузи...")
         no_silence_path = remove_silence(local_path)
 
-        # 3. Транскрипція → субтитри
+        # 3. Транскрипція → субтитри (до перекодування формату, щоб Whisper
+        # отримав оригінальну, ще не перестиснуту звукову доріжку)
         await msg.edit_text("📝 Транскрибую відео...")
         srt_path, transcript = transcribe_to_srt(no_silence_path)
 
-        # 4. Burn-in субтитрів — тільки якщо Whisper/AssemblyAI реально щось
+        # 4. Приводимо до вертикального 9:16 (1080×1920) — якщо відео
+        # горизонтальне/квадратне, порожні поля заповнюються розмитим фоном
+        # замість чорних смуг чи обрізання кадру.
+        await msg.edit_text("📐 Приводжу відео до 9:16...")
+        vertical_path = normalize_vertical(no_silence_path)
+
+        # 5. Burn-in субтитрів — тільки якщо Whisper/AssemblyAI реально щось
         # розпізнали. Якщо у відео немає мовлення (тиша, музика без слів,
         # надто коротке відео), srt вийде порожнім — і спроба напалити
         # субтитри на порожній файл лише зламає весь пайплайн (саме це
@@ -191,10 +199,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ...srt": libass не вміє відкрити 0-байтний файл як субтитри).
         if transcript and transcript.strip():
             await msg.edit_text("🎬 Накладаю субтитри...")
-            final_video_path = burn_subtitles(no_silence_path, srt_path)
+            final_video_path = burn_subtitles(vertical_path, srt_path)
         else:
             await msg.edit_text("🎬 Мовлення не розпізнано — субтитри пропускаю...")
-            final_video_path = no_silence_path
+            final_video_path = vertical_path
 
         # 5. Обкладинка
         await msg.edit_text("🖼 Генерую обкладинку...")
@@ -240,7 +248,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # фінальне відео, кадр, обкладинку) — інакше диск контейнера
         # поступово забивається і це проявляється дивними помилками на
         # начебто непов'язаних кроках пайплайну.
-        for path in [local_path, no_silence_path, srt_path, final_video_path, frame_path, cover_path]:
+        for path in [local_path, no_silence_path, vertical_path, srt_path, final_video_path, frame_path, cover_path]:
             if not path:
                 continue
             try:

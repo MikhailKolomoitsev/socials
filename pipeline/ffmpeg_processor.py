@@ -140,6 +140,47 @@ def _trim_and_concat(input_path: str, segments: list, output_path: str):
         raise RuntimeError(f"ffmpeg помилка (trim+concat): {tail}")
 
 
+def normalize_vertical(input_path: str, width: int = 1080, height: int = 1920) -> str:
+    """
+    Приводить будь-яке відео (горизонтальне, квадратне, "майже вертикальне")
+    до строгого 9:16 (1080×1920) для TikTok.
+
+    На відміну від простого crop (який обрізає й може зрізати важливу
+    частину кадру, напр. голову), тут кадр вписується ПОВНІСТЮ — порожні
+    смуги зверху/збоку заповнюються розмитим збільшеним фоном з того ж
+    відео (як у TikTok/Reels/Stories), а не чорними полями.
+
+    Якщо відео вже рівно 1080×1920 — нічого не робимо й повертаємо
+    оригінальний шлях (без зайвого перекодування).
+    """
+    cw, ch = _probe_resolution(input_path)
+    if cw == width and ch == height:
+        return input_path
+
+    output_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_vertical.mp4")
+
+    filter_complex = (
+        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},boxblur=20:5[bg];"
+        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2[outv]"
+    )
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-filter_complex", filter_complex,
+        "-map", "[outv]", "-map", "0:a?",
+        "-vcodec", "libx264", "-acodec", "aac",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        tail = "\n".join(result.stderr.strip().splitlines()[-15:])
+        raise RuntimeError(f"ffmpeg помилка (normalize_vertical): {tail}")
+
+    return output_path
+
+
 def burn_subtitles(input_path: str, srt_path: str, font_size: int = None, font_color: str = "white") -> str:
     """
     Накладає субтитри на відео у "TikTok-стилі": жирний білий текст з
@@ -170,7 +211,7 @@ def burn_subtitles(input_path: str, srt_path: str, font_size: int = None, font_c
     width, height = _probe_resolution(input_path)
 
     if font_size is None:
-        font_size = _clamp(round(height / 24), 32, 110)
+        font_size = _clamp(round(height / 32), 28, 90)
     margin_v = _clamp(round(height * 0.12), 60, 260)  # відступ від низу, щоб не лізти під UI TikTok
     outline = max(2, round(font_size / 14))
     shadow = max(1, round(font_size / 28))

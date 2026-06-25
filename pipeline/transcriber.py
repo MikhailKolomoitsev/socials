@@ -139,4 +139,8 @@ def _save_srt(content: str) -> str:
     path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}.srt")
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
+        f.flush()
+        os.fsync(f.fileno())  # гарантуємо, що дані реально на диску до return,
+        # а не тільки в буфері процесу — щоб наступний крок (burn_subtitles)
+        # точно знайшов файл, навіть якщо диск під навантаженням.
     return path

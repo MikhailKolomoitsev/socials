@@ -159,6 +159,14 @@ def burn_subtitles(input_path: str, srt_path: str, font_size: int = None, font_c
     """
     output_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_final.mp4")
 
+    # Явна перевірка перед запуском ffmpeg: якщо .srt раптом відсутній або
+    # порожній (диск забитий, файл ще не "доїхав" до диска тощо) — піднімаємо
+    # зрозумілу помилку замість незрозумілого libass "Unable to open ...".
+    if not os.path.exists(srt_path):
+        raise RuntimeError(f"SRT файл не знайдено перед burn-in субтитрів: {srt_path}")
+    if os.path.getsize(srt_path) == 0:
+        raise RuntimeError(f"SRT файл порожній перед burn-in субтитрів: {srt_path}")
+
     width, height = _probe_resolution(input_path)
 
     if font_size is None:

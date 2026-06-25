@@ -163,6 +163,17 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     local_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_raw.mp4")
     await file.download_to_drive(local_path)
 
+    # Усі тимчасові артефакти пайплайну — прибираємо їх ВСІ у finally, а не
+    # лише сире відео. Без цього no-silence-копія, srt, фінальне відео, кадр
+    # і обкладинка накопичуються на диску Railway-контейнера з кожним відео
+    # і з часом можуть забити диск (ENOSPC), що проявляється дивними
+    # помилками типу "Unable to open ...srt" в зовсім інших місцях пайплайну.
+    no_silence_path = None
+    srt_path = None
+    final_video_path = None
+    frame_path = None
+    cover_path = None
+
     try:
         # 2. Видалення пауз
         await msg.edit_text("✂️ Видаляю паузи...")
@@ -211,8 +222,13 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Pipeline error: {e}", exc_info=True)
         await msg.edit_text(f"❌ Помилка обробки: {e}")
     finally:
-        # Прибираємо тимчасові файли
-        for path in [local_path]:
+        # Прибираємо всі тимчасові файли цього відео (сире, no-silence, srt,
+        # фінальне відео, кадр, обкладинку) — інакше диск контейнера
+        # поступово забивається і це проявляється дивними помилками на
+        # начебто непов'язаних кроках пайплайну.
+        for path in [local_path, no_silence_path, srt_path, final_video_path, frame_path, cover_path]:
+            if not path:
+                continue
             try:
                 os.remove(path)
             except Exception:

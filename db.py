@@ -212,13 +212,22 @@ def enqueue(video_id: int, platform: str, scheduled_at: datetime):
 
 
 def get_pending_queue():
+    # scheduled_at зберігається через Python's datetime.isoformat() — формат
+    # "2026-06-25T08:34:16.224357" (з літерою "T" і мікросекундами), тоді як
+    # SQLite datetime('now') повертає "2026-06-25 08:34:25" (з пробілом, без
+    # мікросекунд). Пряме текстове порівняння "<=" між ними ламається: символ
+    # "T" (0x54) лексикографічно більший за пробіл (0x20), тому scheduled_at
+    # завжди "більший" за datetime('now') для тієї ж дати — умова ніколи не
+    # спрацьовувала, і жодне відео з черги ніколи не підхоплювалось.
+    # Обгортаємо обидві сторони в datetime(...), що нормалізує формат і
+    # коректно парсить ISO8601 з "T"-розділювачем.
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT q.*, v.s3_url, v.cover_s3_url, v.transcript
             FROM publish_queue q
             JOIN videos v ON v.id = q.video_id
             WHERE q.status = 'pending'
-              AND q.scheduled_at <= datetime('now')
+              AND datetime(q.scheduled_at) <= datetime('now')
         """).fetchall()
     return [dict(r) for r in rows]
 

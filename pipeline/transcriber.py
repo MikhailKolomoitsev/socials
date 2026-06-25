@@ -40,23 +40,30 @@ def _transcribe_whisper(video_path: str) -> tuple[str, str]:
         )
 
     plain_text = response.text or ""
-    words = response.words or []
+    words = getattr(response, "words", None) or []
 
     if words:
         # Word-level → короткі "панчові" субтитри (3-4 слова на кадр),
         # синхронні з мовленням — TikTok-стиль, а не цілі речення одразу.
+        #
+        # ВАЖЛИВО: модель Transcription у openai==1.35.0 описує тільше поле
+        # "text" — words/segments приходять як "extra"-поля (model_config
+        # extra="allow") і потрапляють сюди як звичайні dict, А НЕ як
+        # pydantic-об'єкти. getattr(dict, "word", default) завжди повертає
+        # default, бо в dict немає атрибутів — тільки ключі. Тому читаємо
+        # через _field(), який працює і з dict, і з об'єктом.
         word_tuples = [
             (
-                (getattr(w, "word", "") or "").strip(),
-                getattr(w, "start", 0) or 0,
-                getattr(w, "end", 0) or 0,
+                (_field(w, "word", "") or "").strip(),
+                _field(w, "start", 0) or 0,
+                _field(w, "end", 0) or 0,
             )
             for w in words
         ]
         srt_content = _word_tuples_to_srt(word_tuples)
     else:
         # Fallback на segment-level, якщо API раптом не повернув слова.
-        srt_content = _segments_to_srt(response.segments or [])
+        srt_content = _segments_to_srt(getattr(response, "segments", None) or [])
 
     srt_path = _save_srt(srt_content)
     return srt_path, plain_text
@@ -93,16 +100,24 @@ def _assemblyai_to_srt(transcript) -> str:
 
 def _segments_to_srt(segments: list) -> str:
     """
-    segments — список об'єктів TranscriptionSegment (pydantic) з SDK openai,
-    не dict-ів, тому атрибути читаємо через getattr, а не .get().
+    segments у різних SDK/відповідях бувають і dict, і pydantic-об'єктами
+    (залежно від версії openai та того, чи поле типізоване чи "extra") —
+    тому читаємо через _field(), яка підтримує обидва варіанти.
     """
     lines = []
     for i, seg in enumerate(segments, start=1):
-        start = _seconds_to_srt_time(getattr(seg, "start", 0) or 0)
-        end = _seconds_to_srt_time(getattr(seg, "end", 0) or 0)
-        text = (getattr(seg, "text", "") or "").strip()
+        start = _seconds_to_srt_time(_field(seg, "start", 0) or 0)
+        end = _seconds_to_srt_time(_field(seg, "end", 0) or 0)
+        text = (_field(seg, "text", "") or "").strip()
         lines.append(f"{i}\n{start} --> {end}\n{text}\n")
     return "\n".join(lines)
+
+
+def _field(obj, key: str, default=None):
+    """Дістає поле з об'єкта незалежно від того, dict це чи pydantic/звичайний об'єкт."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
 
 def _seconds_to_srt_time(seconds: float) -> str:

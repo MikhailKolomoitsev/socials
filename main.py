@@ -183,9 +183,18 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("📝 Транскрибую відео...")
         srt_path, transcript = transcribe_to_srt(no_silence_path)
 
-        # 4. Burn-in субтитрів
-        await msg.edit_text("🎬 Накладаю субтитри...")
-        final_video_path = burn_subtitles(no_silence_path, srt_path)
+        # 4. Burn-in субтитрів — тільки якщо Whisper/AssemblyAI реально щось
+        # розпізнали. Якщо у відео немає мовлення (тиша, музика без слів,
+        # надто коротке відео), srt вийде порожнім — і спроба напалити
+        # субтитри на порожній файл лише зламає весь пайплайн (саме це
+        # ховалось за старою незрозумілою помилкою ffmpeg "Unable to open
+        # ...srt": libass не вміє відкрити 0-байтний файл як субтитри).
+        if transcript and transcript.strip():
+            await msg.edit_text("🎬 Накладаю субтитри...")
+            final_video_path = burn_subtitles(no_silence_path, srt_path)
+        else:
+            await msg.edit_text("🎬 Мовлення не розпізнано — субтитри пропускаю...")
+            final_video_path = no_silence_path
 
         # 5. Обкладинка
         await msg.edit_text("🖼 Генерую обкладинку...")
@@ -210,9 +219,14 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 8. Питаємо коли публікувати
         keyboard = _build_schedule_keyboard()
+        transcript_line = (
+            f"📝 Транскрипція: _{transcript[:100]}..._\n\n"
+            if transcript and transcript.strip()
+            else "📝 Мовлення не розпізнано (без субтитрів)\n\n"
+        )
         await msg.edit_text(
             f"✅ Відео готове!\n\n"
-            f"📝 Транскрипція: _{transcript[:100]}..._\n\n"
+            f"{transcript_line}"
             "Коли публікуємо в TikTok?",
             parse_mode="Markdown",
             reply_markup=keyboard,

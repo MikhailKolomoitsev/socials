@@ -140,14 +140,18 @@ def _trim_and_concat(input_path: str, segments: list, output_path: str):
         raise RuntimeError(f"ffmpeg помилка (trim+concat): {tail}")
 
 
-def burn_subtitles(input_path: str, srt_path: str, font_size: int = 22, font_color: str = "white") -> str:
+def burn_subtitles(input_path: str, srt_path: str, font_size: int = None, font_color: str = "white") -> str:
     """
-    Накладає субтитри на відео.
+    Накладає субтитри на відео у "TikTok-стилі": жирний білий текст з
+    товстою чорною обводкою й тінню (читається на будь-якому фоні),
+    розмір шрифту масштабується відносно роздільної здатності відео
+    (фіксовані 22px були практично невидимі на 1080×1920).
 
     Args:
         input_path: шлях до відео (після silence removal)
         srt_path: шлях до .srt файлу
-        font_size: розмір шрифту субтитрів
+        font_size: розмір шрифту субтитрів; якщо None — рахується від
+                   висоти відео (~ height/24, з розумними межами)
         font_color: колір тексту
 
     Returns:
@@ -155,15 +159,28 @@ def burn_subtitles(input_path: str, srt_path: str, font_size: int = 22, font_col
     """
     output_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_final.mp4")
 
+    width, height = _probe_resolution(input_path)
+
+    if font_size is None:
+        font_size = _clamp(round(height / 24), 32, 110)
+    margin_v = _clamp(round(height * 0.12), 60, 260)  # відступ від низу, щоб не лізти під UI TikTok
+    outline = max(2, round(font_size / 14))
+    shadow = max(1, round(font_size / 28))
+
     # Екрануємо шлях для ffmpeg subtitles filter
     escaped_srt = srt_path.replace("\\", "/").replace(":", "\\:")
 
     subtitle_style = (
+        "FontName=DejaVu Sans,"
         f"FontSize={font_size},"
         f"PrimaryColour=&H00{_color_to_bgr(font_color)},"
+        "OutlineColour=&H00000000,"
+        "BorderStyle=1,"
+        f"Outline={outline},"
+        f"Shadow={shadow},"
         "Bold=1,"
         "Alignment=2,"          # знизу по центру
-        "MarginV=30"
+        f"MarginV={margin_v}"
     )
 
     _run(
@@ -180,6 +197,25 @@ def burn_subtitles(input_path: str, srt_path: str, font_size: int = 22, font_col
     )
 
     return output_path
+
+
+def _probe_resolution(path: str) -> tuple:
+    """Повертає (width, height) відео через ffprobe."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", "-of", "json", path,
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe помилка (resolution): {result.stderr.strip()}")
+    stream = json.loads(result.stdout)["streams"][0]
+    return stream["width"], stream["height"]
+
+
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
 
 
 def extract_frame(video_path: str, timestamp: float = 1.0) -> str:

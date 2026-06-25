@@ -36,12 +36,27 @@ def _transcribe_whisper(video_path: str) -> tuple[str, str]:
             model="whisper-1",
             file=f,
             response_format="verbose_json",
-            timestamp_granularities=["segment"],
+            timestamp_granularities=["word", "segment"],
         )
 
-    segments = response.segments or []
-    srt_content = _segments_to_srt(segments)
     plain_text = response.text or ""
+    words = response.words or []
+
+    if words:
+        # Word-level → короткі "панчові" субтитри (3-4 слова на кадр),
+        # синхронні з мовленням — TikTok-стиль, а не цілі речення одразу.
+        word_tuples = [
+            (
+                (getattr(w, "word", "") or "").strip(),
+                getattr(w, "start", 0) or 0,
+                getattr(w, "end", 0) or 0,
+            )
+            for w in words
+        ]
+        srt_content = _word_tuples_to_srt(word_tuples)
+    else:
+        # Fallback на segment-level, якщо API раптом не повернув слова.
+        srt_content = _segments_to_srt(response.segments or [])
 
     srt_path = _save_srt(srt_content)
     return srt_path, plain_text
@@ -69,20 +84,9 @@ def _transcribe_assemblyai(video_path: str) -> tuple[str, str]:
 
 
 def _assemblyai_to_srt(transcript) -> str:
-    lines = []
     words = transcript.words or []
-
-    # Групуємо по ~5 слів на рядок субтитра
-    chunk_size = 5
-    chunks = [words[i:i + chunk_size] for i in range(0, len(words), chunk_size)]
-
-    for i, chunk in enumerate(chunks, start=1):
-        start_ms = chunk[0].start
-        end_ms = chunk[-1].end
-        text = " ".join(w.text for w in chunk)
-        lines.append(f"{i}\n{_ms_to_srt_time(start_ms)} --> {_ms_to_srt_time(end_ms)}\n{text}\n")
-
-    return "\n".join(lines)
+    word_tuples = [(w.text, w.start / 1000, w.end / 1000) for w in words]
+    return _word_tuples_to_srt(word_tuples)
 
 
 # ── Утиліти ───────────────────────────────────────────────────────────────────
@@ -109,8 +113,26 @@ def _seconds_to_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def _ms_to_srt_time(ms: int) -> str:
-    return _seconds_to_srt_time(ms / 1000)
+def _word_tuples_to_srt(word_tuples: list, chunk_size: int = 4) -> str:
+    """
+    word_tuples: список (text, start_seconds, end_seconds) у хронологічному порядку.
+
+    Групує слова по chunk_size на один кадр субтитра — короткі "панчові"
+    фрази, що з'являються синхронно з мовленням (TikTok-стиль), а не
+    цілі речення одночасно на екрані.
+    """
+    words = [w for w in word_tuples if w[0]]
+    if not words:
+        return ""
+
+    lines = []
+    chunks = [words[i:i + chunk_size] for i in range(0, len(words), chunk_size)]
+    for i, chunk in enumerate(chunks, start=1):
+        start = _seconds_to_srt_time(chunk[0][1])
+        end = _seconds_to_srt_time(chunk[-1][2])
+        text = " ".join(w[0] for w in chunk)
+        lines.append(f"{i}\n{start} --> {end}\n{text}\n")
+    return "\n".join(lines)
 
 
 def _save_srt(content: str) -> str:

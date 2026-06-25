@@ -1,2 +1,5 @@
 [phases.setup]
-aptPkgs = ["ffmpeg"]
+# fontconfig + fonts-dejavu-core потрібні для ffmpeg-фільтра "subtitles" (libass):
+# без жодного зареєстрованого шрифту burn-in субтитрів проходить без помилки,
+# але текст просто невидимий (немає гліфів, особливо для кирилиці).
+aptPkgs = ["ffmpeg", "fontconfig", "fonts-dejavu-core"]

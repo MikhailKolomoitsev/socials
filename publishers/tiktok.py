@@ -113,7 +113,12 @@ def publish_video(video_url: str, caption: str, cover_image_url: str = None) -> 
         json=body,
         timeout=30,
     )
-    resp.raise_for_status()
+    if resp.status_code != 200:
+        # raise_for_status() ховає тіло відповіді TikTok (де саме і написано
+        # справжню причину, напр. url_ownership_unverified / scope_not_authorized /
+        # spam_risk_too_many_pending_share) — піднімаємо тіло явно, щоб бачити
+        # його в Railway-логах замість голого "403 Forbidden".
+        raise RuntimeError(f"TikTok publish HTTP {resp.status_code}: {resp.text}")
     data = resp.json()
 
     if data.get("error", {}).get("code") != "ok":

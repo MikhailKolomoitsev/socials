@@ -7,6 +7,7 @@ import logging
 import time
 
 import db
+from pipeline.caption_generator import generate_caption
 from publishers.tiktok import publish_video as tiktok_publish
 from publishers.instagram import publish_reel
 
@@ -67,14 +68,11 @@ def _publish_instagram(item: dict):
 
 
 def _generate_tiktok_caption(transcript: str) -> str:
-    """Генерує caption. Розшир через OpenAI якщо потрібно."""
-    base = transcript[:200] if transcript else "Новий контент"
-    return f"{base}\n\n#hypnotherapy #hypnosis #mentalhealth #fyp #foryou"
+    return generate_caption(transcript, platform="tiktok")
 
 
 def _generate_instagram_caption(transcript: str) -> str:
-    base = transcript[:200] if transcript else "Новий контент"
-    return f"{base}\n\n#hypnotherapy #hypnosis #mentalhealth #reels #instareels"
+    return generate_caption(transcript, platform="instagram")
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ import db
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, TMP_DIR, TIKTOK_PUBLISH_TIMES, TIKTOK_DAILY_LIMIT
 from pipeline.ffmpeg_processor import remove_silence, normalize_vertical, burn_subtitles, extract_frame
 from pipeline.transcriber import transcribe_to_srt
-from pipeline.cover_generator import generate_cover
+from pipeline.cover_generator import generate_cover_ai as generate_cover
 from pipeline.uploader import upload_file
 from scheduler.queue_runner import run as queue_runner_run
 from webapp.server import start_in_background as start_webapp
@@ -319,7 +319,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 5. Обкладинка
         await msg.edit_text("🖼 Генерую обкладинку...")
         frame_path = extract_frame(final_video_path, timestamp=1.5)
-        cover_path = generate_cover(frame_path, subtitle_text=transcript[:60] + "..." if len(transcript) > 60 else transcript)
+        cover_path = generate_cover(transcript, frame_path)
 
         # 6. Завантаження на S3
         await msg.edit_text("☁️ Завантажую на S3...")

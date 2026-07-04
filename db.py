@@ -143,6 +143,16 @@ def create_video(original_filename: str, s3_url: str, cover_s3_url: str, transcr
         return cur.lastrowid
 
 
+def set_tiktok_caption_draft(video_id: int, caption: str):
+    """Зберігає попередньо згенерований підпис одразу після обробки відео,
+    щоб queue_runner міг його використати без повторної генерації."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE videos SET tiktok_caption=? WHERE id=? AND tiktok_caption IS NULL",
+            (caption, video_id),
+        )
+
+
 def set_tiktok_published(video_id: int, tiktok_video_id: str, caption: str):
     with get_conn() as conn:
         conn.execute(
@@ -231,7 +241,7 @@ def get_pending_queue():
     # коректно парсить ISO8601 з "T"-розділювачем.
     with get_conn() as conn:
         rows = conn.execute("""
-            SELECT q.*, v.s3_url, v.cover_s3_url, v.transcript
+            SELECT q.*, v.s3_url, v.cover_s3_url, v.transcript, v.tiktok_caption
             FROM publish_queue q
             JOIN videos v ON v.id = q.video_id
             WHERE q.status = 'pending'

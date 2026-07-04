@@ -10,3 +10,4 @@ apscheduler==3.10.4
 aiofiles==23.2.1
 httpx==0.27.0
 Flask==3.0.3
+fal-client==0.5.9

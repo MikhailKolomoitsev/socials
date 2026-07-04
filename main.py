@@ -36,6 +36,7 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, TMP_DIR, TIKTOK
 from pipeline.ffmpeg_processor import remove_silence, normalize_vertical, burn_subtitles, extract_frame
 from pipeline.transcriber import transcribe_to_srt
 from pipeline.cover_generator import generate_cover_ai as generate_cover
+from pipeline.caption_generator import generate_caption
 from pipeline.uploader import upload_file
 from scheduler.queue_runner import run as queue_runner_run
 from webapp.server import start_in_background as start_webapp
@@ -337,7 +338,31 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Зберігаємо video_id в context для callback
         context.user_data["pending_video_id"] = video_id
 
-        # 8. Питаємо коли публікувати
+        # 8. Надсилаємо обкладинку + готовий підпис для ручного використання
+        if transcript and transcript.strip():
+            try:
+                tiktok_caption = await asyncio.to_thread(generate_caption, transcript, "tiktok")
+                # Зберігаємо підпис щоб queue_runner не генерував вдруге
+                db.set_tiktok_caption_draft(video_id, tiktok_caption)
+                caption_preview = f"📋 *Підпис для TikTok* (скопіюй):\n\n{tiktok_caption}"
+            except Exception as e:
+                logger.warning(f"Caption generation failed: {e}")
+                tiktok_caption = ""
+                caption_preview = "_(підпис не вдалось згенерувати)_"
+
+            try:
+                with open(cover_path, "rb") as img:
+                    await update.message.reply_photo(
+                        photo=img,
+                        caption=caption_preview,
+                        parse_mode="Markdown",
+                    )
+            except Exception as e:
+                logger.warning(f"Не вдалось надіслати обкладинку: {e}")
+                # Надсилаємо хоча б підпис текстом
+                await update.message.reply_text(caption_preview, parse_mode="Markdown")
+
+        # 9. Питаємо коли публікувати
         keyboard = _build_schedule_keyboard()
         transcript_line = (
             f"📝 Транскрипція: _{transcript[:100]}..._\n\n"

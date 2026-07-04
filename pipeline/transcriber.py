@@ -128,7 +128,7 @@ def _seconds_to_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def _word_tuples_to_srt(word_tuples: list, chunk_size: int = 4) -> str:
+def _word_tuples_to_srt(word_tuples: list, chunk_size: int = 3) -> str:
     """
     word_tuples: список (text, start_seconds, end_seconds) у хронологічному порядку.
 

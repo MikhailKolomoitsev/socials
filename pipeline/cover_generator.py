@@ -26,7 +26,7 @@ import uuid
 import requests as http_requests
 from PIL import Image, ImageDraw, ImageFont
 
-from config import TMP_DIR, OPENAI_API_KEY
+from config import TMP_DIR, OPENAI_API_KEY, FAL_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -57,17 +57,21 @@ COVER_STYLE_SUFFIX = os.getenv("COVER_STYLE_SUFFIX", _DEFAULT_STYLE)
 
 def generate_cover_ai(transcript: str, frame_path: str) -> str:
     """
-    Генерує AI-обкладинку: DALL-E 3 фон + hook зверху + логотип.
+    Генерує AI-обкладинку: fal.ai FLUX фон + hook зверху + логотип.
     При помилці — fallback на кадр з відео.
+
+    Пріоритет генератора зображень:
+      1. fal.ai FLUX (FAL_KEY) — висока якість, нативний 9:16, ~$0.003-0.006/зображення
+      2. Fallback: кадр з відео з текстом (без AI зображення)
     """
     if not OPENAI_API_KEY:
         logger.info("OPENAI_API_KEY не задано — frame fallback для обкладинки")
         return generate_cover(frame_path, subtitle_text=(transcript or "")[:60])
 
     try:
-        hook_text, dalle_prompt = _plan_cover(transcript)
-        logger.info(f"Cover hook: «{hook_text}» | prompt: {dalle_prompt[:80]}…")
-        bg = _dalle_generate(dalle_prompt)
+        hook_text, image_prompt = _plan_cover(transcript)
+        logger.info(f"Cover hook: «{hook_text}» | prompt: {image_prompt[:80]}…")
+        bg = _fal_generate(image_prompt)
         return _compose(bg, hook_text)
     except Exception as e:
         logger.warning(f"AI cover failed ({e}), using frame fallback")
@@ -149,22 +153,47 @@ def _plan_cover(transcript: str) -> tuple:
     return hook, prompt
 
 
-def _dalle_generate(concept_prompt: str) -> Image.Image:
-    """DALL-E 3 → PIL Image."""
-    from openai import OpenAI
-    client = OpenAI(api_key=OPENAI_API_KEY)
+def _fal_generate(concept_prompt: str) -> Image.Image:
+    """
+    fal.ai FLUX → PIL Image (1080×1920, нативний 9:16).
+
+    Модель: fal-ai/flux/dev
+      - висока якість, ~$0.025/зображення
+      - підтримує довільний розмір
+      - час генерації: ~5-15 сек
+
+    Якщо FAL_KEY не задано — піднімає RuntimeError → fallback у generate_cover_ai.
+    """
+    if not FAL_KEY:
+        raise RuntimeError("FAL_KEY не задано — пропускаємо fal.ai генерацію")
+
+    import fal_client
 
     full_prompt = f"{concept_prompt}. {COVER_STYLE_SUFFIX}"
 
-    resp = client.images.generate(
-        model="dall-e-3",
-        prompt=full_prompt,
-        size="1024x1792",   # 9:16 portrait
-        quality="standard", # ~$0.04/зображення
-        n=1,
+    # Встановлюємо ключ для fal-client (він читає змінну середовища FAL_KEY,
+    # але встановлюємо явно для надійності)
+    import os as _os
+    _os.environ.setdefault("FAL_KEY", FAL_KEY)
+
+    result = fal_client.run(
+        "fal-ai/flux/dev",
+        arguments={
+            "prompt": full_prompt,
+            "image_size": {
+                "width": 1080,
+                "height": 1920,
+            },
+            "num_inference_steps": 28,
+            "guidance_scale": 3.5,
+            "num_images": 1,
+            "enable_safety_checker": False,
+            "output_format": "jpeg",
+        },
     )
 
-    raw = http_requests.get(resp.data[0].url, timeout=45).content
+    image_url = result["images"][0]["url"]
+    raw = http_requests.get(image_url, timeout=45).content
     return Image.open(io.BytesIO(raw)).convert("RGB")
 
 

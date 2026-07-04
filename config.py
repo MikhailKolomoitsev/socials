@@ -7,9 +7,12 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_ALLOWED_USER_ID = int(os.getenv("TELEGRAM_ALLOWED_USER_ID", "0"))
 
-# Транскрипція
+# Транскрипція / GPT-4o
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+
+# Генерація обкладинок (fal.ai FLUX)
+FAL_KEY = os.getenv("FAL_KEY")
 
 # S3 (або Cloudflare R2 — S3-сумісне; тоді задай S3_ENDPOINT_URL)
 S3_BUCKET = os.getenv("S3_BUCKET")

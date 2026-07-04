@@ -46,7 +46,9 @@ def _process_queue():
 
 
 def _publish_tiktok(item: dict):
-    caption = _generate_tiktok_caption(item.get("transcript", ""))
+    # Якщо підпис вже згенеровано одразу після обробки (і збережено в DB) —
+    # використовуємо його; інакше генеруємо зараз.
+    caption = item.get("tiktok_caption") or _generate_tiktok_caption(item.get("transcript", ""))
     video_id = tiktok_publish(
         video_url=item["s3_url"],
         caption=caption,

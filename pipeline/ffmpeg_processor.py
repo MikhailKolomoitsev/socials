@@ -211,8 +211,8 @@ def burn_subtitles(input_path: str, srt_path: str, font_size: int = None, font_c
     width, height = _probe_resolution(input_path)
 
     if font_size is None:
-        font_size = _clamp(round(height / 32), 28, 90)
-    margin_v = _clamp(round(height * 0.12), 60, 260)  # відступ від низу, щоб не лізти під UI TikTok
+        font_size = _clamp(round(height / 40), 22, 52)
+    margin_v = _clamp(round(height * 0.13), 80, 280)  # відступ від низу, щоб не лізти під UI TikTok
     outline = max(2, round(font_size / 14))
     shadow = max(1, round(font_size / 28))
 

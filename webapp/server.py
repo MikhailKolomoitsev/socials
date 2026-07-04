@@ -37,7 +37,10 @@ TIKTOK_SCOPES = "user.info.basic,video.upload"
 
 # Instagram API with Instagram Login (Business Login) — заміна старих
 # instagram_basic/instagram_content_publish (deprecated 27.01.2025).
-INSTAGRAM_SCOPES = "instagram_business_basic,instagram_business_content_publish"
+# instagram_business_manage_messages додано для розсилки в Direct (/dm_blast) —
+# після додавання нового scope потрібно ПЕРЕПРОЙТИ /auth/instagram/login,
+# стара авторизація без цього permission'у видавання повідомлень не дозволить.
+INSTAGRAM_SCOPES = "instagram_business_basic,instagram_business_content_publish,instagram_business_manage_messages"
 
 
 @app.route("/")

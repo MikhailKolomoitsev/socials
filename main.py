@@ -39,7 +39,8 @@ from pipeline.cover_generator import generate_cover
 from pipeline.uploader import upload_file
 from scheduler.queue_runner import run as queue_runner_run
 from webapp.server import start_in_background as start_webapp
-from publishers.instagram import publish_reel, adapt_caption_for_instagram
+from publishers.instagram import publish_reel, adapt_caption_for_instagram, get_valid_token_and_user_id
+from publishers.instagram_dm import list_dm_candidates, run_broadcast
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [BOT] %(message)s")
 logger = logging.getLogger(__name__)
@@ -60,7 +61,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Привіт! Надішли відео — я його оброблю і поставлю в чергу для публікації.\n\n"
         "/status — статус сьогоднішніх публікацій\n"
         "/queue — черга\n"
-        "/publish_ig — опублікувати в Instagram відео, яке вже \"вибухнуло\" в TikTok"
+        "/publish_ig — опублікувати в Instagram відео, яке вже \"вибухнуло\" в TikTok\n"
+        "/dm_blast <текст> — одноразова розсилка в Instagram Direct усім, хто вже писав"
     )
 
 
@@ -142,6 +144,116 @@ async def handle_publish_ig_callback(update: Update, context: ContextTypes.DEFAU
     except Exception as e:
         logger.error(f"Помилка публікації в Instagram: {e}", exc_info=True)
         await query.edit_message_text(f"❌ Помилка публікації в Instagram: {e}")
+
+
+# ── Instagram Direct: одноразова розсилка ────────────────────────────────────
+
+async def cmd_dm_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Одноразова розсилка в Instagram Direct усім, хто вже писав акаунту.
+
+    /dm_blast <текст> — спочатку показує прев'ю (скільки діалогів знайдено,
+    скільки з них поза 24-годинним вікном і, ймовірно, отримають помилку від
+    Instagram), і просить підтвердження кнопкою. Нічого не надсилається без
+    явного підтвердження.
+    """
+    if not is_allowed(update):
+        return
+
+    text = " ".join(context.args) if context.args else ""
+    if not text.strip():
+        await update.message.reply_text(
+            "Використання: /dm_blast <текст повідомлення>\n\n"
+            "Надішле це повідомлення всім, хто вже писав акаунту в Instagram "
+            "Direct (одноразово, не автовідповідач на нові повідомлення). "
+            "Спочатку покажу прев'ю — нічого не надсилається без підтвердження.\n\n"
+            "⚠️ Юридично автоматизовані повідомлення мають бути позначені як такі — "
+            "додай це в текст сам, напр. \"(автоматичне повідомлення)\"."
+        )
+        return
+
+    await update.message.reply_text("🔎 Перевіряю, кому вже можна написати...")
+
+    try:
+        access_token, ig_user_id = get_valid_token_and_user_id()
+        candidates = list_dm_candidates(access_token, ig_user_id)
+    except Exception as e:
+        logger.error(f"Помилка отримання списку діалогів Instagram: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ Не вдалось отримати список діалогів: {e}\n\n"
+            "Якщо помилка про permission — потрібно додати "
+            "instagram_business_manage_messages і перепройти /auth/instagram/login."
+        )
+        return
+
+    if not candidates:
+        await update.message.reply_text(
+            "Не знайшов жодного діалогу через Instagram API. Можливо, потрібен "
+            "новий permission instagram_business_manage_messages — перепройди "
+            "/auth/instagram/login, якщо ще не робив цього після оновлення."
+        )
+        return
+
+    within_24h = sum(1 for c in candidates if c["within_24h"])
+    context.user_data["dm_blast_text"] = text
+
+    await update.message.reply_text(
+        f"📋 Знайдено {len(candidates)} діалогів.\n"
+        f"✅ {within_24h} у межах 24-годинного вікна (дійде точно).\n"
+        f"⚠️ {len(candidates) - within_24h} поза вікном — Instagram, ймовірно, "
+        "відхилить надсилання їм (обмеження платформи, не бот).\n\n"
+        f"Текст:\n{text}\n\n"
+        "Підтвердити розсилку?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"✅ Надіслати ({len(candidates)})", callback_data="dm_blast_confirm"),
+            InlineKeyboardButton("❌ Скасувати", callback_data="dm_blast_cancel"),
+        ]]),
+    )
+
+
+async def handle_dm_blast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_allowed(update):
+        return
+
+    if query.data == "dm_blast_cancel":
+        context.user_data.pop("dm_blast_text", None)
+        await query.edit_message_text("Скасовано.")
+        return
+
+    text = context.user_data.pop("dm_blast_text", None)
+    if not text:
+        await query.edit_message_text(
+            "❌ Текст розсилки не знайдено (можливо, бот перезапустився) — "
+            "почни знову через /dm_blast."
+        )
+        return
+
+    await query.edit_message_text(
+        "📤 Надсилаю... (може зайняти кілька хвилин через паузи між повідомленнями)"
+    )
+
+    try:
+        access_token, ig_user_id = get_valid_token_and_user_id()
+        result = await asyncio.to_thread(run_broadcast, access_token, ig_user_id, text, False, 4.0)
+    except Exception as e:
+        logger.error(f"Помилка розсилки Instagram DM: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Помилка розсилки: {e}")
+        return
+
+    report = (
+        "✅ Розсилку завершено.\n\n"
+        f"Надіслано: {len(result['sent'])}\n"
+        f"Пропущено (вже надсилали раніше): {len(result['skipped_already_sent'])}\n"
+        f"Не вдалось: {len(result['failed'])}"
+    )
+    if result["failed"]:
+        sample = "\n".join(f"• {f['igsid']}: {f['error'][:80]}" for f in result["failed"][:5])
+        report += f"\n\nПриклади помилок (найчастіше — поза 24-годинним вікном):\n{sample}"
+
+    await query.edit_message_text(report)
 
 
 # ── Обробка відео ─────────────────────────────────────────────────────────────
@@ -329,9 +441,11 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("publish_ig", cmd_publish_ig))
+    app.add_handler(CommandHandler("dm_blast", cmd_dm_blast))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(CallbackQueryHandler(handle_schedule_callback, pattern=r"^schedule_tiktok:"))
     app.add_handler(CallbackQueryHandler(handle_publish_ig_callback, pattern=r"^publish_ig:"))
+    app.add_handler(CallbackQueryHandler(handle_dm_blast_callback, pattern=r"^dm_blast_(confirm|cancel)$"))
 
     logger.info("Бот запущено. Очікую відео...")
     app.run_polling(drop_pending_updates=True)

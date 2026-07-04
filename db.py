@@ -66,6 +66,14 @@ def init_db():
                 created_at TEXT DEFAULT (datetime('now')),
                 FOREIGN KEY (video_id) REFERENCES videos(id)
             );
+
+            CREATE TABLE IF NOT EXISTS instagram_dm_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                igsid TEXT NOT NULL,
+                status TEXT NOT NULL,   -- 'sent' / 'failed'
+                error TEXT,
+                sent_at TEXT DEFAULT (datetime('now'))
+            );
         """)
 
 
@@ -240,6 +248,27 @@ def mark_queue_done(queue_id: int):
 def mark_queue_failed(queue_id: int):
     with get_conn() as conn:
         conn.execute("UPDATE publish_queue SET status='failed' WHERE id=?", (queue_id,))
+
+
+# ── Instagram Direct — одноразова розсилка ──────────────────────────────────
+
+def log_dm_sent(igsid: str, status: str, error: str = None):
+    """Фіксує спробу надсилання DM (sent/failed), щоб повторний запуск
+    розсилки не дублював повідомлення тим, кому вже надіслано успішно."""
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO instagram_dm_log (igsid, status, error) VALUES (?,?,?)",
+            (igsid, status, error),
+        )
+
+
+def get_dmed_igsids() -> set:
+    """IGSID усіх, кому вже УСПІШНО надсилали розсилку (щоб не дублювати)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT igsid FROM instagram_dm_log WHERE status='sent'"
+        ).fetchall()
+    return {r["igsid"] for r in rows}
 
 
 def count_tiktoks_today() -> int:

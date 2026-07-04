@@ -75,6 +75,13 @@ def _get_valid_token_and_user_id():
     return data["access_token"], tokens["ig_user_id"]
 
 
+def get_valid_token_and_user_id():
+    """Публічна обгортка над _get_valid_token_and_user_id() — для повторного
+    використання тієї самої логіки токенів (DB + auto-refresh) з інших
+    модулів (напр. publishers/instagram_dm.py), без дублювання коду."""
+    return _get_valid_token_and_user_id()
+
+
 def publish_reel(video_url: str, caption: str, cover_url: str = None) -> str:
     """
     Публікує Reels в Instagram (двоетапний процес: create → publish).

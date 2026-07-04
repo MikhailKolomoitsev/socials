@@ -6,6 +6,7 @@
 import os
 import uuid
 from config import TMP_DIR, OPENAI_API_KEY, ASSEMBLYAI_API_KEY
+from pipeline.ffmpeg_processor import extract_audio
 
 
 def transcribe_to_srt(video_path: str) -> tuple[str, str]:
@@ -31,13 +32,22 @@ def _transcribe_whisper(video_path: str) -> tuple[str, str]:
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    with open(video_path, "rb") as f:
-        response = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f,
-            response_format="verbose_json",
-            timestamp_granularities=["word", "segment"],
-        )
+    # Витягуємо лише аудіо (mp3 16kHz ~5MB) замість повного відео (50-200MB).
+    # Whisper API має ліміт 25MB — відео легко його перевищує, аудіо — ніколи.
+    audio_path = extract_audio(video_path)
+    try:
+        with open(audio_path, "rb") as f:
+            response = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                response_format="verbose_json",
+                timestamp_granularities=["word", "segment"],
+            )
+    finally:
+        try:
+            os.remove(audio_path)
+        except Exception:
+            pass
 
     plain_text = response.text or ""
     words = getattr(response, "words", None) or []

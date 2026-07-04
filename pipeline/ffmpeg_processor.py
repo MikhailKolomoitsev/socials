@@ -325,6 +325,33 @@ def _probe_resolution(path: str) -> tuple:
     return stream["width"], stream["height"]
 
 
+def extract_audio(video_path: str) -> str:
+    """
+    Витягує аудіодоріжку з відео у форматі mp3.
+
+    Whisper API має ліміт 25MB на файл. Відео після обробки може важити
+    50-200MB, але аудіо з того ж відео — лише 3-8MB (mp3 128kbps).
+    Передаємо в Whisper тільки аудіо, а не весь відеофайл.
+
+    Returns:
+        Шлях до .mp3 файлу
+    """
+    output_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_audio.mp3")
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-vn",                   # без відеопотоку
+        "-c:a", "libmp3lame",
+        "-b:a", "128k",
+        "-ar", "16000",          # 16kHz — оптимально для Whisper
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        tail = "\n".join(result.stderr.strip().splitlines()[-10:])
+        raise RuntimeError(f"ffmpeg помилка (extract_audio): {tail}")
+    return output_path
+
+
 def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 

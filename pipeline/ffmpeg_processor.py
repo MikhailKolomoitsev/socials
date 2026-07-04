@@ -141,31 +141,65 @@ def _invert_intervals(silence: list, duration: float) -> list:
 
 
 def _trim_and_concat(input_path: str, segments: list, output_path: str):
-    filter_parts = []
-    concat_inputs = []
-    for i, (start, end) in enumerate(segments):
-        filter_parts.append(
-            f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS[v{i}]"
-        )
-        filter_parts.append(
-            f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS[a{i}]"
-        )
-        concat_inputs.append(f"[v{i}][a{i}]")
+    """
+    Надійний trim+concat через concat demuxer:
+      1. Кожен сегмент кодується окремо (→ temp файл з keyframe на початку)
+      2. Всі temp файли об'єднуються через concat demuxer з -c copy
 
-    filter_complex = ";".join(filter_parts) + ";" + "".join(concat_inputs) + \
-        f"concat=n={len(segments)}:v=1:a=1[outv][outa]"
+    Попередній підхід (один filter_complex на всі сегменти) давав frame=0
+    після to_standard_mp4 бо trim filter не міг знайти keyframe у потрібний
+    момент при постійному FPS H.264 потоці.
+    """
+    temp_files = []
+    concat_list_lines = []
 
-    cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-filter_complex", filter_complex,
-        "-map", "[outv]", "-map", "[outa]",
-        "-vcodec", "libx264", "-acodec", "aac",
-        output_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        tail = "\n".join(result.stderr.strip().splitlines()[-15:])
-        raise RuntimeError(f"ffmpeg помилка (trim+concat): {tail}")
+    try:
+        for i, (start, end) in enumerate(segments):
+            seg_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_seg{i}.mp4")
+            temp_files.append(seg_path)
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", f"{start:.3f}",
+                "-to", f"{end:.3f}",
+                "-i", input_path,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-c:a", "aac", "-b:a", "192k",
+                "-avoid_negative_ts", "make_zero",
+                seg_path,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                tail = "\n".join(result.stderr.strip().splitlines()[-10:])
+                raise RuntimeError(f"ffmpeg помилка (trim сегмент {i}): {tail}")
+
+            concat_list_lines.append(f"file '{seg_path}'")
+
+        # Записуємо список сегментів у тимчасовий файл
+        concat_txt = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_concat.txt")
+        temp_files.append(concat_txt)
+        with open(concat_txt, "w") as f:
+            f.write("\n".join(concat_list_lines))
+
+        # Склеюємо без перекодування
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_txt,
+            "-c", "copy",
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            tail = "\n".join(result.stderr.strip().splitlines()[-10:])
+            raise RuntimeError(f"ffmpeg помилка (concat): {tail}")
+
+    finally:
+        for p in temp_files:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
 
 def normalize_vertical(input_path: str, width: int = 1080, height: int = 1920) -> str:

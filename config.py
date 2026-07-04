@@ -14,6 +14,10 @@ ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 # Генерація обкладинок (fal.ai FLUX)
 FAL_KEY = os.getenv("FAL_KEY")
 
+# Google Drive інтеграція
+GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")          # JSON service account (компактний рядок)
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")  # ID папки для відео
+
 # S3 (або Cloudflare R2 — S3-сумісне; тоді задай S3_ENDPOINT_URL)
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_REGION = os.getenv("S3_REGION", "eu-central-1")

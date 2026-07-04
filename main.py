@@ -21,7 +21,9 @@ import threading
 import uuid
 from datetime import datetime, timedelta
 
+import requests as http_requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest as TgBadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -42,6 +44,8 @@ from scheduler.queue_runner import run as queue_runner_run
 from webapp.server import start_in_background as start_webapp
 from publishers.instagram import publish_reel, adapt_caption_for_instagram, get_valid_token_and_user_id
 from publishers.instagram_dm import list_dm_candidates, run_broadcast
+from pipeline.drive_watcher import list_new_videos, download_file as drive_download, mark_processed, extract_file_id
+from config import GOOGLE_DRIVE_FOLDER_ID
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [BOT] %(message)s")
 logger = logging.getLogger(__name__)
@@ -60,10 +64,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "👋 Привіт! Надішли відео — я його оброблю і поставлю в чергу для публікації.\n\n"
+        "Якщо відео >20MB — надішли посилання:\n"
+        "`/process_url https://...`\n\n"
         "/status — статус сьогоднішніх публікацій\n"
         "/queue — черга\n"
         "/publish_ig — опублікувати в Instagram відео, яке вже \"вибухнуло\" в TikTok\n"
-        "/dm_blast <текст> — одноразова розсилка в Instagram Direct усім, хто вже писав"
+        "/dm_blast <текст> — одноразова розсилка в Instagram Direct усім, хто вже писав",
+        parse_mode="Markdown",
     )
 
 
@@ -259,6 +266,116 @@ async def handle_dm_blast_callback(update: Update, context: ContextTypes.DEFAULT
 
 # ── Обробка відео ─────────────────────────────────────────────────────────────
 
+async def cmd_process_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /process_url <https://...>  — завантажити відео за посиланням.
+
+    Підтримує:
+      • Google Drive посилання (drive.google.com/file/d/...) — через Service Account
+      • Будь-яке пряме посилання на mp4 (Dropbox ?dl=1, власний S3 тощо)
+    """
+    if not is_allowed(update):
+        return
+
+    url = " ".join(context.args).strip() if context.args else ""
+    if not url.startswith("http"):
+        await update.message.reply_text(
+            "Використання: `/process_url https://...`\n\n"
+            "Підтримується Google Drive та будь-яке пряме посилання на mp4.",
+            parse_mode="Markdown",
+        )
+        return
+
+    msg = await update.message.reply_text("📥 Завантажую відео...")
+
+    try:
+        # Google Drive — завантажуємо через Service Account (без ліміту розміру)
+        if "drive.google.com" in url or "docs.google.com" in url:
+            file_id = extract_file_id(url)
+            if not file_id:
+                await msg.edit_text("❌ Не вдалось витягти ID файлу з посилання Google Drive.")
+                return
+            local_path = await asyncio.to_thread(drive_download, file_id, "video.mp4")
+        else:
+            # Пряме посилання
+            local_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_raw.mp4")
+            resp = await asyncio.to_thread(
+                lambda: http_requests.get(url, stream=True, timeout=120)
+            )
+            resp.raise_for_status()
+            with open(local_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+    except Exception as e:
+        await msg.edit_text(f"❌ Не вдалось завантажити відео: {e}")
+        return
+
+    await _process_video_file(update, context, msg, local_path)
+
+
+async def cmd_scan_drive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /scan_drive — показує нові відео у папці Google Drive.
+    Кожне відео — кнопка, натискаєш → бот завантажує і обробляє.
+    """
+    if not is_allowed(update):
+        return
+
+    if not GOOGLE_DRIVE_FOLDER_ID:
+        await update.message.reply_text(
+            "❌ GOOGLE_DRIVE_FOLDER_ID не задано.\n"
+            "Додай ID папки в Railway Variables і перезапусти бот."
+        )
+        return
+
+    await update.message.reply_text("🔍 Перевіряю папку Google Drive...")
+
+    try:
+        files = await asyncio.to_thread(list_new_videos)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Помилка доступу до Drive: {e}")
+        return
+
+    if not files:
+        await update.message.reply_text(
+            "✅ Нових відео в папці немає.\n\n"
+            "Закинь відео у папку Google Drive і натисни /scan_drive знову."
+        )
+        return
+
+    buttons = []
+    for f in files[:10]:  # максимум 10 кнопок
+        size_mb = int(f.get("size", 0)) // (1024 * 1024)
+        label = f"🎬 {f['name']} ({size_mb} MB)"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"drive_process:{f['id']}:{f['name']}")])
+
+    await update.message.reply_text(
+        f"📂 Знайдено {len(files)} нових відео у Google Drive.\nОбери яке обробити:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def handle_drive_process_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробляє натискання кнопки для конкретного файлу з Drive."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_allowed(update):
+        return
+
+    _, file_id, filename = query.data.split(":", 2)
+    msg = await query.edit_message_text(f"📥 Завантажую «{filename}» з Google Drive...")
+
+    try:
+        local_path = await asyncio.to_thread(drive_download, file_id, filename)
+        mark_processed(file_id)
+    except Exception as e:
+        await msg.edit_text(f"❌ Помилка завантаження з Drive: {e}")
+        return
+
+    await _process_video_file(update, context, msg, local_path, filename)
+
+
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -270,17 +387,37 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("❌ Надішли відео файл (.mp4)")
         return
 
-    # 1. Завантажуємо відео з Telegram
+    # Telegram Bot API дозволяє завантажувати файли лише до ~20MB.
     await msg.edit_text("📥 Завантажую відео...")
-    file = await context.bot.get_file(video.file_id)
     local_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_raw.mp4")
-    await file.download_to_drive(local_path)
+    try:
+        file = await context.bot.get_file(video.file_id)
+        await file.download_to_drive(local_path)
+    except TgBadRequest as e:
+        if "file is too big" in str(e).lower():
+            await msg.edit_text(
+                "❌ Відео завелике для Telegram Bot API (ліміт ~20MB).\n\n"
+                "Надішли пряме посилання на відео:\n"
+                "`/process_url https://example.com/video.mp4`\n\n"
+                "Або стисни відео перед відправкою.",
+                parse_mode="Markdown",
+            )
+        else:
+            await msg.edit_text(f"❌ Помилка Telegram: {e}")
+        return
 
-    # Усі тимчасові артефакти пайплайну — прибираємо їх ВСІ у finally, а не
-    # лише сире відео. Без цього no-silence-копія, srt, фінальне відео, кадр
-    # і обкладинка накопичуються на диску Railway-контейнера з кожним відео
-    # і з часом можуть забити диск (ENOSPC), що проявляється дивними
-    # помилками типу "Unable to open ...srt" в зовсім інших місцях пайплайну.
+    original_name = getattr(video, "file_name", None) or "video.mp4"
+    await _process_video_file(update, context, msg, local_path, original_name)
+
+
+async def _process_video_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    msg,
+    local_path: str,
+    original_name: str = "video.mp4",
+):
+    """Спільний пайплайн обробки відео для handle_video і cmd_process_url."""
     no_silence_path = None
     vertical_path = None
     srt_path = None
@@ -289,27 +426,19 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cover_path = None
 
     try:
-        # 2. Видалення пауз
+        # 1. Видалення пауз
         await msg.edit_text("✂️ Видаляю паузи...")
         no_silence_path = remove_silence(local_path)
 
-        # 3. Транскрипція → субтитри (до перекодування формату, щоб Whisper
-        # отримав оригінальну, ще не перестиснуту звукову доріжку)
+        # 2. Транскрипція → субтитри
         await msg.edit_text("📝 Транскрибую відео...")
         srt_path, transcript = transcribe_to_srt(no_silence_path)
 
-        # 4. Приводимо до вертикального 9:16 (1080×1920) — якщо відео
-        # горизонтальне/квадратне, порожні поля заповнюються розмитим фоном
-        # замість чорних смуг чи обрізання кадру.
+        # 3. Нормалізація до 9:16
         await msg.edit_text("📐 Приводжу відео до 9:16...")
         vertical_path = normalize_vertical(no_silence_path)
 
-        # 5. Burn-in субтитрів — тільки якщо Whisper/AssemblyAI реально щось
-        # розпізнали. Якщо у відео немає мовлення (тиша, музика без слів,
-        # надто коротке відео), srt вийде порожнім — і спроба напалити
-        # субтитри на порожній файл лише зламає весь пайплайн (саме це
-        # ховалось за старою незрозумілою помилкою ffmpeg "Unable to open
-        # ...srt": libass не вміє відкрити 0-байтний файл як субтитри).
+        # 4. Burn-in субтитрів
         if transcript and transcript.strip():
             await msg.edit_text("🎬 Накладаю субтитри...")
             final_video_path = burn_subtitles(vertical_path, srt_path)
@@ -329,25 +458,21 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 7. Зберігаємо в БД
         video_id = db.create_video(
-            original_filename=video.file_name or "video.mp4",
+            original_filename=original_name,
             s3_url=s3_video_url,
             cover_s3_url=s3_cover_url,
             transcript=transcript,
         )
-
-        # Зберігаємо video_id в context для callback
         context.user_data["pending_video_id"] = video_id
 
-        # 8. Надсилаємо обкладинку + готовий підпис для ручного використання
+        # 8. Надсилаємо обкладинку + готовий підпис
         if transcript and transcript.strip():
             try:
                 tiktok_caption = await asyncio.to_thread(generate_caption, transcript, "tiktok")
-                # Зберігаємо підпис щоб queue_runner не генерував вдруге
                 db.set_tiktok_caption_draft(video_id, tiktok_caption)
                 caption_preview = f"📋 *Підпис для TikTok* (скопіюй):\n\n{tiktok_caption}"
             except Exception as e:
                 logger.warning(f"Caption generation failed: {e}")
-                tiktok_caption = ""
                 caption_preview = "_(підпис не вдалось згенерувати)_"
 
             try:
@@ -359,7 +484,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати обкладинку: {e}")
-                # Надсилаємо хоча б підпис текстом
                 await update.message.reply_text(caption_preview, parse_mode="Markdown")
 
         # 9. Питаємо коли публікувати
@@ -370,9 +494,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else "📝 Мовлення не розпізнано (без субтитрів)\n\n"
         )
         await msg.edit_text(
-            f"✅ Відео готове!\n\n"
-            f"{transcript_line}"
-            "Коли публікуємо в TikTok?",
+            f"✅ Відео готове!\n\n{transcript_line}Коли публікуємо в TikTok?",
             parse_mode="Markdown",
             reply_markup=keyboard,
         )
@@ -381,10 +503,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Pipeline error: {e}", exc_info=True)
         await msg.edit_text(f"❌ Помилка обробки: {e}")
     finally:
-        # Прибираємо всі тимчасові файли цього відео (сире, no-silence, srt,
-        # фінальне відео, кадр, обкладинку) — інакше диск контейнера
-        # поступово забивається і це проявляється дивними помилками на
-        # начебто непов'язаних кроках пайплайну.
         for path in [local_path, no_silence_path, vertical_path, srt_path, final_video_path, frame_path, cover_path]:
             if not path:
                 continue
@@ -467,6 +585,9 @@ def main():
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("publish_ig", cmd_publish_ig))
     app.add_handler(CommandHandler("dm_blast", cmd_dm_blast))
+    app.add_handler(CommandHandler("process_url", cmd_process_url))
+    app.add_handler(CommandHandler("scan_drive", cmd_scan_drive))
+    app.add_handler(CallbackQueryHandler(handle_drive_process_callback, pattern=r"^drive_process:"))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(CallbackQueryHandler(handle_schedule_callback, pattern=r"^schedule_tiktok:"))
     app.add_handler(CallbackQueryHandler(handle_publish_ig_callback, pattern=r"^publish_ig:"))

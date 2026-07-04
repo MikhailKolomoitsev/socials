@@ -564,6 +564,176 @@ async def handle_schedule_callback(update: Update, context: ContextTypes.DEFAULT
     )
 
 
+# ── Google Drive auto-poller ──────────────────────────────────────────────────
+
+DRIVE_POLL_INTERVAL = 120  # секунди між перевірками папки
+
+
+async def _drive_poll_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    PTB job: запускається кожні DRIVE_POLL_INTERVAL секунд.
+    Перевіряє папку Drive на нові відео і одразу обробляє їх.
+    """
+    if not GOOGLE_DRIVE_FOLDER_ID:
+        return
+
+    chat_id = TELEGRAM_ALLOWED_USER_ID
+    try:
+        files = await asyncio.to_thread(list_new_videos)
+    except Exception as e:
+        logger.error(f"Drive poller помилка: {e}", exc_info=True)
+        return
+
+    for f in files:
+        file_id = f["id"]
+        filename = f["name"]
+        size_mb = int(f.get("size", 0)) // (1024 * 1024)
+
+        logger.info(f"Drive poller: знайдено «{filename}» ({size_mb} MB)")
+        mark_processed(file_id)
+
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"📂 Знайшов нове відео у Google Drive:\n`{filename}` ({size_mb} MB)\n\n⏳ Завантажую і починаю обробку...",
+            parse_mode="Markdown",
+        )
+
+        try:
+            local_path = await asyncio.to_thread(drive_download, file_id, filename)
+        except Exception as e:
+            await msg.edit_text(f"❌ Не вдалось завантажити «{filename}» з Drive: {e}")
+            continue
+
+        await _process_drive_file(context.application, chat_id, msg, local_path, filename)
+
+
+async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename: str):
+    """
+    Запускає пайплайн обробки для файлу з Drive без реального telegram.Update.
+    Надсилає результати напряму в chat_id.
+    """
+    no_silence_path = vertical_path = srt_path = None
+    final_video_path = frame_path = cover_path = None
+
+    try:
+        await msg.edit_text(f"✂️ «{filename}» — видаляю паузи...")
+        no_silence_path = await asyncio.to_thread(remove_silence, local_path)
+
+        await msg.edit_text(f"📝 «{filename}» — транскрибую...")
+        srt_path, transcript = await asyncio.to_thread(transcribe_to_srt, no_silence_path)
+
+        await msg.edit_text(f"📐 «{filename}» — приводжу до 9:16...")
+        vertical_path = await asyncio.to_thread(normalize_vertical, no_silence_path)
+
+        if transcript and transcript.strip():
+            await msg.edit_text(f"🎬 «{filename}» — накладаю субтитри...")
+            final_video_path = await asyncio.to_thread(burn_subtitles, vertical_path, srt_path)
+        else:
+            final_video_path = vertical_path
+
+        await msg.edit_text(f"🖼 «{filename}» — генерую обкладинку...")
+        frame_path = await asyncio.to_thread(extract_frame, final_video_path, 1.5)
+        cover_path = await asyncio.to_thread(generate_cover, transcript, frame_path)
+
+        await msg.edit_text(f"☁️ «{filename}» — завантажую на S3...")
+        s3_video_url = await asyncio.to_thread(upload_file, final_video_path, "videos")
+        s3_cover_url = await asyncio.to_thread(upload_file, cover_path, "covers")
+
+        video_id = db.create_video(
+            original_filename=filename,
+            s3_url=s3_video_url,
+            cover_s3_url=s3_cover_url,
+            transcript=transcript,
+        )
+
+        # Підпис + обкладинка
+        if transcript and transcript.strip():
+            try:
+                tiktok_caption = await asyncio.to_thread(generate_caption, transcript, "tiktok")
+                db.set_tiktok_caption_draft(video_id, tiktok_caption)
+                caption_preview = f"📋 *Підпис для TikTok* (скопіюй):\n\n{tiktok_caption}"
+            except Exception as e:
+                logger.warning(f"Caption generation failed: {e}")
+                caption_preview = "_(підпис не вдалось згенерувати)_"
+
+            try:
+                with open(cover_path, "rb") as img:
+                    await app.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=img,
+                        caption=caption_preview,
+                        parse_mode="Markdown",
+                    )
+            except Exception as e:
+                logger.warning(f"Не вдалось надіслати обкладинку: {e}")
+                await app.bot.send_message(chat_id=chat_id, text=caption_preview, parse_mode="Markdown")
+
+        # Клавіатура планування — зберігаємо video_id через inline дані
+        keyboard = _build_drive_schedule_keyboard(video_id)
+        transcript_line = f"📝 _{transcript[:100]}..._\n\n" if transcript and transcript.strip() else ""
+        await msg.edit_text(
+            f"✅ «{filename}» готове!\n\n{transcript_line}Коли публікуємо в TikTok?",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+
+    except Exception as e:
+        logger.error(f"Drive pipeline error: {e}", exc_info=True)
+        await msg.edit_text(f"❌ Помилка обробки «{filename}»: {e}")
+    finally:
+        for path in [local_path, no_silence_path, vertical_path, srt_path, final_video_path, frame_path, cover_path]:
+            if not path:
+                continue
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+
+def _build_drive_schedule_keyboard(video_id: int) -> InlineKeyboardMarkup:
+    """Кнопки планування для відео з Drive (video_id вбудований у callback_data)."""
+    buttons = []
+    now = datetime.now()
+    for time_str in TIKTOK_PUBLISH_TIMES:
+        h, m = map(int, time_str.split(":"))
+        scheduled = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if scheduled <= now:
+            scheduled += timedelta(days=1)
+        buttons.append([InlineKeyboardButton(
+            f"🕐 {time_str}",
+            callback_data=f"schedule_drive:{video_id}:{scheduled.isoformat()}",
+        )])
+    buttons.append([InlineKeyboardButton(
+        "🔴 Зараз",
+        callback_data=f"schedule_drive:{video_id}:now",
+    )])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def handle_drive_schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробляє вибір часу публікації для відео що прийшло з Drive."""
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(update):
+        return
+
+    _, video_id_str, time_part = query.data.split(":", 2)
+    video_id = int(video_id_str)
+
+    if time_part == "now":
+        scheduled_at = datetime.now()
+        label = "зараз"
+    else:
+        scheduled_at = datetime.fromisoformat(time_part)
+        label = scheduled_at.strftime("%H:%M")
+
+    db.enqueue(video_id, "tiktok", scheduled_at)
+    await query.edit_message_text(
+        f"✅ Поставлено в чергу на TikTok о {label}.\n"
+        "Відео потрапить у твої TikTok-чернетки — відкрий TikTok і натисни «Опублікувати»."
+    )
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -588,10 +758,21 @@ def main():
     app.add_handler(CommandHandler("process_url", cmd_process_url))
     app.add_handler(CommandHandler("scan_drive", cmd_scan_drive))
     app.add_handler(CallbackQueryHandler(handle_drive_process_callback, pattern=r"^drive_process:"))
+    app.add_handler(CallbackQueryHandler(handle_drive_schedule_callback, pattern=r"^schedule_drive:"))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(CallbackQueryHandler(handle_schedule_callback, pattern=r"^schedule_tiktok:"))
     app.add_handler(CallbackQueryHandler(handle_publish_ig_callback, pattern=r"^publish_ig:"))
     app.add_handler(CallbackQueryHandler(handle_dm_blast_callback, pattern=r"^dm_blast_(confirm|cancel)$"))
+
+    # Drive poller: перевіряє папку кожні 2 хвилини
+    if GOOGLE_DRIVE_FOLDER_ID:
+        app.job_queue.run_repeating(
+            _drive_poll_job,
+            interval=DRIVE_POLL_INTERVAL,
+            first=30,  # перша перевірка через 30с після старту
+            name="drive_poller",
+        )
+        logger.info(f"Drive poller: перевірка кожні {DRIVE_POLL_INTERVAL}с.")
 
     logger.info("Бот запущено. Очікую відео...")
     app.run_polling(drop_pending_updates=True)

@@ -28,6 +28,34 @@ def _run(stream):
         raise RuntimeError(f"ffmpeg помилка: {tail or 'немає stderr'}") from e
 
 
+def to_standard_mp4(input_path: str) -> str:
+    """
+    Конвертує будь-який формат (MOV, HEVC/H.265, змінний FPS тощо) у
+    стандартний H.264 + AAC mp4 з фіксованим 30fps.
+
+    iPhone знімає у HEVC зі змінним frame rate — trim+concat і subtitles
+    filter ламаються на таких файлах. Цей крок нормалізує все до стандарту
+    перед будь-якою подальшою обробкою.
+
+    Якщо вхід вже H.264 з постійним FPS — перекодування все одно виконується
+    для гарантії сумісності (займає ~10-30с для 3-хвилинного відео).
+    """
+    output_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_std.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k",
+        "-r", "30",           # фіксований 30fps (усуває VFR)
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        tail = "\n".join(result.stderr.strip().splitlines()[-15:])
+        raise RuntimeError(f"ffmpeg помилка (to_standard_mp4): {tail}")
+    return output_path
+
+
 def remove_silence(input_path: str, silence_threshold: float = -35.0, min_silence_duration: float = 0.5) -> str:
     """
     Видаляє паузи з відео (синхронно з відео- і аудіопотоку).

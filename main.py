@@ -35,7 +35,7 @@ from telegram.ext import (
 
 import db
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, TMP_DIR, TIKTOK_PUBLISH_TIMES, TIKTOK_DAILY_LIMIT
-from pipeline.ffmpeg_processor import remove_silence, normalize_vertical, burn_subtitles, extract_frame
+from pipeline.ffmpeg_processor import to_standard_mp4, remove_silence, normalize_vertical, burn_subtitles, extract_frame
 from pipeline.transcriber import transcribe_to_srt
 from pipeline.cover_generator import generate_cover_ai as generate_cover
 from pipeline.caption_generator import generate_caption
@@ -418,6 +418,7 @@ async def _process_video_file(
     original_name: str = "video.mp4",
 ):
     """Спільний пайплайн обробки відео для handle_video і cmd_process_url."""
+    std_path = None
     no_silence_path = None
     vertical_path = None
     srt_path = None
@@ -426,9 +427,13 @@ async def _process_video_file(
     cover_path = None
 
     try:
+        # 0. Конвертуємо до стандартного H.264/AAC (MOV, HEVC, VFR → mp4 30fps)
+        await msg.edit_text("🔄 Конвертую формат відео...")
+        std_path = await asyncio.to_thread(to_standard_mp4, local_path)
+
         # 1. Видалення пауз
         await msg.edit_text("✂️ Видаляю паузи...")
-        no_silence_path = remove_silence(local_path)
+        no_silence_path = remove_silence(std_path)
 
         # 2. Транскрипція → субтитри
         await msg.edit_text("📝 Транскрибую відео...")
@@ -612,12 +617,15 @@ async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename:
     Запускає пайплайн обробки для файлу з Drive без реального telegram.Update.
     Надсилає результати напряму в chat_id.
     """
-    no_silence_path = vertical_path = srt_path = None
+    std_path = no_silence_path = vertical_path = srt_path = None
     final_video_path = frame_path = cover_path = None
 
     try:
+        await msg.edit_text(f"🔄 «{filename}» — конвертую формат...")
+        std_path = await asyncio.to_thread(to_standard_mp4, local_path)
+
         await msg.edit_text(f"✂️ «{filename}» — видаляю паузи...")
-        no_silence_path = await asyncio.to_thread(remove_silence, local_path)
+        no_silence_path = await asyncio.to_thread(remove_silence, std_path)
 
         await msg.edit_text(f"📝 «{filename}» — транскрибую...")
         srt_path, transcript = await asyncio.to_thread(transcribe_to_srt, no_silence_path)
@@ -681,12 +689,13 @@ async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename:
         logger.error(f"Drive pipeline error: {e}", exc_info=True)
         await msg.edit_text(f"❌ Помилка обробки «{filename}»: {e}")
     finally:
-        for path in [local_path, no_silence_path, vertical_path, srt_path, final_video_path, frame_path, cover_path]:
+        for path in [local_path, std_path, no_silence_path, vertical_path, srt_path, final_video_path, frame_path, cover_path]:
             if not path:
                 continue
             try:
                 os.remove(path)
             except Exception:
+                pass
                 pass
 
 

@@ -470,26 +470,28 @@ async def _process_video_file(
         )
         context.user_data["pending_video_id"] = video_id
 
-        # 8. Надсилаємо обкладинку + готовий підпис
+        # 8. Надсилаємо обкладинку + підпис окремим повідомленням (code-блок = кнопка Copy)
         if transcript and transcript.strip():
             try:
                 tiktok_caption = await asyncio.to_thread(generate_caption, transcript, "tiktok")
                 db.set_tiktok_caption_draft(video_id, tiktok_caption)
-                caption_preview = f"📋 *Підпис для TikTok* (скопіюй):\n\n{tiktok_caption}"
             except Exception as e:
                 logger.warning(f"Caption generation failed: {e}")
-                caption_preview = "_(підпис не вдалось згенерувати)_"
+                tiktok_caption = None
 
+            # Обкладинка окремим фото
             try:
                 with open(cover_path, "rb") as img:
-                    await update.message.reply_photo(
-                        photo=img,
-                        caption=caption_preview,
-                        parse_mode="Markdown",
-                    )
+                    await update.message.reply_photo(photo=img, caption="🖼 Обкладинка")
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати обкладинку: {e}")
-                await update.message.reply_text(caption_preview, parse_mode="Markdown")
+
+            # Підпис окремим повідомленням у code-блоку → Telegram показує кнопку Copy
+            if tiktok_caption:
+                await update.message.reply_text(
+                    f"📋 Підпис для TikTok — натисни щоб скопіювати:\n\n```\n{tiktok_caption}\n```",
+                    parse_mode="Markdown",
+                )
 
         # 9. Питаємо коли публікувати
         keyboard = _build_schedule_keyboard()
@@ -659,22 +661,22 @@ async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename:
             try:
                 tiktok_caption = await asyncio.to_thread(generate_caption, transcript, "tiktok")
                 db.set_tiktok_caption_draft(video_id, tiktok_caption)
-                caption_preview = f"📋 *Підпис для TikTok* (скопіюй):\n\n{tiktok_caption}"
             except Exception as e:
                 logger.warning(f"Caption generation failed: {e}")
-                caption_preview = "_(підпис не вдалось згенерувати)_"
+                tiktok_caption = None
 
             try:
                 with open(cover_path, "rb") as img:
-                    await app.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=img,
-                        caption=caption_preview,
-                        parse_mode="Markdown",
-                    )
+                    await app.bot.send_photo(chat_id=chat_id, photo=img, caption="🖼 Обкладинка")
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати обкладинку: {e}")
-                await app.bot.send_message(chat_id=chat_id, text=caption_preview, parse_mode="Markdown")
+
+            if tiktok_caption:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"📋 Підпис для TikTok — натисни щоб скопіювати:\n\n```\n{tiktok_caption}\n```",
+                    parse_mode="Markdown",
+                )
 
         # Клавіатура планування — зберігаємо video_id через inline дані
         keyboard = _build_drive_schedule_keyboard(video_id)

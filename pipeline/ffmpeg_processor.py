@@ -33,20 +33,16 @@ def to_standard_mp4(input_path: str) -> str:
     Конвертує будь-який формат (MOV, HEVC/H.265, змінний FPS тощо) у
     стандартний H.264 + AAC mp4 з фіксованим 30fps.
 
-    iPhone знімає у HEVC зі змінним frame rate — trim+concat і subtitles
-    filter ламаються на таких файлах. Цей крок нормалізує все до стандарту
-    перед будь-якою подальшою обробкою.
-
-    Якщо вхід вже H.264 з постійним FPS — перекодування все одно виконується
-    для гарантії сумісності (займає ~10-30с для 3-хвилинного відео).
+    Використовує ultrafast preset — якість трохи нижча ніж fast, але в 3-4x
+    швидше. Це проміжний файл для обробки, тому якість некритична —
+    фінальна якість визначається кроком burn_subtitles (де crf=18).
     """
     output_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_std.mp4")
     cmd = [
         "ffmpeg", "-y", "-i", input_path,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-c:a", "aac", "-b:a", "192k",
-        "-r", "30",           # фіксований 30fps (усуває VFR)
-        "-movflags", "+faststart",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-r", "30",
         output_path,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -163,8 +159,8 @@ def _trim_and_concat(input_path: str, segments: list, output_path: str):
                 "-ss", f"{start:.3f}",
                 "-to", f"{end:.3f}",
                 "-i", input_path,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                "-c:a", "aac", "-b:a", "192k",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
                 "-avoid_negative_ts", "make_zero",
                 seg_path,
             ]
@@ -232,7 +228,8 @@ def normalize_vertical(input_path: str, width: int = 1080, height: int = 1920) -
         "ffmpeg", "-y", "-i", input_path,
         "-filter_complex", filter_complex,
         "-map", "[outv]", "-map", "0:a?",
-        "-vcodec", "libx264", "-acodec", "aac",
+        "-vcodec", "libx264", "-preset", "ultrafast", "-crf", "23",
+        "-acodec", "aac", "-b:a", "128k",
         output_path,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)

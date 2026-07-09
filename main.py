@@ -45,7 +45,7 @@ from scheduler.queue_runner import run as queue_runner_run
 from webapp.server import start_in_background as start_webapp
 from publishers.instagram import publish_reel, adapt_caption_for_instagram, get_valid_token_and_user_id
 from publishers.instagram_dm import list_dm_candidates, run_broadcast
-from pipeline.drive_watcher import list_new_videos, download_file as drive_download, mark_processed, extract_file_id
+from pipeline.drive_watcher import list_all_videos, download_file as drive_download, is_processing, mark_processing, unmark_processing, extract_file_id
 from config import GOOGLE_DRIVE_FOLDER_ID
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [BOT] %(message)s")
@@ -587,7 +587,7 @@ async def _drive_poll_job(context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = TELEGRAM_ALLOWED_USER_ID
     try:
-        files = await asyncio.to_thread(list_new_videos)
+        files = await asyncio.to_thread(list_all_videos)
     except Exception as e:
         logger.error(f"Drive poller помилка: {e}", exc_info=True)
         return
@@ -597,31 +597,35 @@ async def _drive_poll_job(context: ContextTypes.DEFAULT_TYPE):
         filename = f["name"]
         size_mb = int(f.get("size", 0)) // (1024 * 1024)
 
-        # Пропускаємо якщо вже є в БД (оброблялось раніше — навіть після рестарту)
-        if db.is_filename_known(filename):
-            mark_processed(file_id)  # щоб не перевіряти знову в цьому сеансі
-            logger.info(f"Drive poller: «{filename}» вже оброблялось — пропускаємо")
+        # 1. Вже в обробці прямо зараз (паралельний запуск poll)
+        if is_processing(file_id):
             continue
 
-        logger.info(f"Drive poller: знайдено нове відео «{filename}» ({size_mb} MB)")
-        mark_processed(file_id)
+        # 2. Вже є в БД по назві файлу — оброблялось раніше (навіть після рестарту)
+        if db.is_filename_known(filename):
+            logger.debug(f"Drive poller: «{filename}» вже в БД — пропускаємо")
+            continue
+
+        logger.info(f"Drive poller: нове відео «{filename}» ({size_mb} MB)")
+        mark_processing(file_id)
 
         msg = await context.bot.send_message(
             chat_id=chat_id,
-            text=f"📂 Знайшов нове відео у Google Drive:\n`{filename}` ({size_mb} MB)\n\n⏳ Завантажую і починаю обробку...",
-            parse_mode="Markdown",
+            text=f"📂 Знайшов нове відео у Google Drive:\n<code>{html.escape(filename)}</code> ({size_mb} MB)\n\n⏳ Завантажую і починаю обробку...",
+            parse_mode="HTML",
         )
 
         try:
             local_path = await asyncio.to_thread(drive_download, file_id, filename)
         except Exception as e:
+            unmark_processing(file_id)
             await msg.edit_text(f"❌ Не вдалось завантажити «{filename}» з Drive: {e}")
             continue
 
-        await _process_drive_file(context.application, chat_id, msg, local_path, filename)
+        await _process_drive_file(context.application, chat_id, msg, local_path, filename, file_id)
 
 
-async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename: str):
+async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename: str, file_id: str = ""):
     """
     Запускає пайплайн обробки для файлу з Drive без реального telegram.Update.
     Надсилає результати напряму в chat_id.
@@ -698,13 +702,13 @@ async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename:
         logger.error(f"Drive pipeline error: {e}", exc_info=True)
         await msg.edit_text(f"❌ Помилка обробки «{filename}»: {e}")
     finally:
+        unmark_processing(file_id)
         for path in [local_path, std_path, no_silence_path, vertical_path, srt_path, final_video_path, frame_path, cover_path]:
             if not path:
                 continue
             try:
                 os.remove(path)
             except Exception:
-                pass
                 pass
 
 

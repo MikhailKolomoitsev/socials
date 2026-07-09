@@ -23,10 +23,9 @@ from config import TMP_DIR, GOOGLE_SA_JSON, GOOGLE_DRIVE_FOLDER_ID
 
 logger = logging.getLogger(__name__)
 
-# ID файлів, які вже оброблено (щоб не дублювати між перевірками).
-# При перезапуску сервісу скидається — але БД videos захистить від повторної
-# публікації, бо пайплайн перевіряє наявність s3_url.
-_processed_ids: set = set()
+# File ID-и що ЗАРАЗ в обробці (щоб не запускати двічі паралельно).
+# Очищується при рестарті — нічого страшного, бо дублікати блокуються через БД.
+_currently_processing: set = set()
 
 
 def _build_service():
@@ -45,11 +44,12 @@ def _build_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def list_new_videos(folder_id: str = None) -> list[dict]:
+def list_all_videos(folder_id: str = None) -> list[dict]:
     """
-    Повертає список нових mp4-файлів у папці Drive, яких ще не обробляли.
+    Повертає всі відеофайли у папці Drive (без фільтрації).
+    Фільтрацію "вже оброблено" робить poll-job через БД по назві файлу.
 
-    Кожен елемент: {"id": ..., "name": ..., "size": ..., "created_time": ...}
+    Кожен елемент: {"id": ..., "name": ..., "size": ..., "createdTime": ...}
     """
     fid = folder_id or GOOGLE_DRIVE_FOLDER_ID
     if not fid:
@@ -66,12 +66,10 @@ def list_new_videos(folder_id: str = None) -> list[dict]:
         q=query,
         fields="files(id,name,size,createdTime,mimeType)",
         orderBy="createdTime desc",
-        pageSize=20,
+        pageSize=50,
     ).execute()
 
-    files = results.get("files", [])
-    new_files = [f for f in files if f["id"] not in _processed_ids]
-    return new_files
+    return results.get("files", [])
 
 
 def download_file(file_id: str, filename: str = None) -> str:
@@ -96,9 +94,18 @@ def download_file(file_id: str, filename: str = None) -> str:
     return local_path
 
 
-def mark_processed(file_id: str):
-    """Позначає файл як оброблений, щоб не підхоплювати вдруге."""
-    _processed_ids.add(file_id)
+def is_processing(file_id: str) -> bool:
+    return file_id in _currently_processing
+
+
+def mark_processing(file_id: str):
+    """Позначає файл як такий, що зараз в обробці (захист від паралельного запуску)."""
+    _currently_processing.add(file_id)
+
+
+def unmark_processing(file_id: str):
+    """Знімає позначку після завершення обробки."""
+    _currently_processing.discard(file_id)
 
 
 def extract_file_id(url: str) -> str | None:

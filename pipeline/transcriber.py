@@ -28,6 +28,8 @@ def transcribe_to_srt(video_path: str) -> tuple[str, str]:
 # ── OpenAI Whisper ─────────────────────────────────────────────────────────────
 
 def _transcribe_whisper(video_path: str) -> tuple[str, str]:
+    import logging
+    logger = logging.getLogger(__name__)
     from openai import OpenAI
 
     client = OpenAI(api_key=OPENAI_API_KEY)
@@ -36,6 +38,7 @@ def _transcribe_whisper(video_path: str) -> tuple[str, str]:
     # Whisper API має ліміт 25MB — відео легко його перевищує, аудіо — ніколи.
     audio_path = extract_audio(video_path)
     try:
+        # Спочатку пробуємо з явною мовою uk (щоб не плутало з російською)
         with open(audio_path, "rb") as f:
             response = client.audio.transcriptions.create(
                 model="whisper-1",
@@ -44,6 +47,19 @@ def _transcribe_whisper(video_path: str) -> tuple[str, str]:
                 response_format="verbose_json",
                 timestamp_granularities=["word", "segment"],
             )
+
+        # Якщо Whisper повернув порожній результат з language=uk —
+        # повторюємо без мовного фільтру (auto-detect). Краще будь-які
+        # субтитри, ніж взагалі без них.
+        if not (response.text or "").strip():
+            logger.warning("Whisper з language=uk повернув порожній текст — повторюю без мовного фільтру")
+            with open(audio_path, "rb") as f:
+                response = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    response_format="verbose_json",
+                    timestamp_granularities=["word", "segment"],
+                )
     finally:
         try:
             os.remove(audio_path)

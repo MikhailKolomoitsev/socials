@@ -281,6 +281,16 @@ def get_dmed_igsids() -> set:
     return {r["igsid"] for r in rows}
 
 
+def is_filename_known(filename: str) -> bool:
+    """Повертає True якщо відео з такою назвою вже є в БД (вже оброблялось раніше)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM videos WHERE original_filename = ? LIMIT 1",
+            (filename,),
+        ).fetchone()
+    return row is not None
+
+
 def count_tiktoks_today() -> int:
     with get_conn() as conn:
         row = conn.execute("""

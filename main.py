@@ -15,6 +15,7 @@ Telegram бот — точка входу.
 """
 
 import asyncio
+import html
 import logging
 import os
 import threading
@@ -489,8 +490,8 @@ async def _process_video_file(
             # Підпис окремим повідомленням у code-блоку → Telegram показує кнопку Copy
             if tiktok_caption:
                 await update.message.reply_text(
-                    f"📋 Підпис для TikTok — натисни щоб скопіювати:\n\n```\n{tiktok_caption}\n```",
-                    parse_mode="Markdown",
+                    f"📋 Підпис для TikTok — натисни щоб скопіювати:\n\n<pre>{html.escape(tiktok_caption)}</pre>",
+                    parse_mode="HTML",
                 )
 
         # 9. Питаємо коли публікувати
@@ -596,7 +597,13 @@ async def _drive_poll_job(context: ContextTypes.DEFAULT_TYPE):
         filename = f["name"]
         size_mb = int(f.get("size", 0)) // (1024 * 1024)
 
-        logger.info(f"Drive poller: знайдено «{filename}» ({size_mb} MB)")
+        # Пропускаємо якщо вже є в БД (оброблялось раніше — навіть після рестарту)
+        if db.is_filename_known(filename):
+            mark_processed(file_id)  # щоб не перевіряти знову в цьому сеансі
+            logger.info(f"Drive poller: «{filename}» вже оброблялось — пропускаємо")
+            continue
+
+        logger.info(f"Drive poller: знайдено нове відео «{filename}» ({size_mb} MB)")
         mark_processed(file_id)
 
         msg = await context.bot.send_message(
@@ -674,8 +681,8 @@ async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename:
             if tiktok_caption:
                 await app.bot.send_message(
                     chat_id=chat_id,
-                    text=f"📋 Підпис для TikTok — натисни щоб скопіювати:\n\n```\n{tiktok_caption}\n```",
-                    parse_mode="Markdown",
+                    text=f"📋 Підпис для TikTok — натисни щоб скопіювати:\n\n<pre>{html.escape(tiktok_caption)}</pre>",
+                    parse_mode="HTML",
                 )
 
         # Клавіатура планування — зберігаємо video_id через inline дані

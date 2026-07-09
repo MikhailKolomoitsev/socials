@@ -87,10 +87,10 @@ def _transcribe_whisper(video_path: str) -> tuple[str, str]:
             )
             for w in words
         ]
-        srt_content = _word_tuples_to_srt(word_tuples)
+        srt_content = _word_tuples_to_ass(word_tuples)
     else:
         # Fallback на segment-level, якщо API раптом не повернув слова.
-        srt_content = _segments_to_srt(getattr(response, "segments", None) or [])
+        srt_content = _segments_to_ass(getattr(response, "segments", None) or [])
 
     srt_path = _save_srt(srt_content)
     return srt_path, plain_text
@@ -120,24 +120,21 @@ def _transcribe_assemblyai(video_path: str) -> tuple[str, str]:
 def _assemblyai_to_srt(transcript) -> str:
     words = transcript.words or []
     word_tuples = [(w.text, w.start / 1000, w.end / 1000) for w in words]
-    return _word_tuples_to_srt(word_tuples)
+    return _word_tuples_to_ass(word_tuples)
 
 
 # ── Утиліти ───────────────────────────────────────────────────────────────────
 
-def _segments_to_srt(segments: list) -> str:
-    """
-    segments у різних SDK/відповідях бувають і dict, і pydantic-об'єктами
-    (залежно від версії openai та того, чи поле типізоване чи "extra") —
-    тому читаємо через _field(), яка підтримує обидва варіанти.
-    """
-    lines = []
-    for i, seg in enumerate(segments, start=1):
-        start = _seconds_to_srt_time(_field(seg, "start", 0) or 0)
-        end = _seconds_to_srt_time(_field(seg, "end", 0) or 0)
+def _segments_to_ass(segments: list) -> str:
+    """Fallback: сегменти → ASS (коли word-level недоступний)."""
+    chunks = []
+    for seg in segments:
+        start = _field(seg, "start", 0) or 0
+        end = _field(seg, "end", 0) or 0
         text = (_field(seg, "text", "") or "").strip()
-        lines.append(f"{i}\n{start} --> {end}\n{text}\n")
-    return "\n".join(lines)
+        if text:
+            chunks.append((text, start, end))
+    return _chunks_to_ass(chunks)
 
 
 def _field(obj, key: str, default=None):
@@ -147,42 +144,78 @@ def _field(obj, key: str, default=None):
     return getattr(obj, key, default)
 
 
-def _seconds_to_srt_time(seconds: float) -> str:
-    ms = int((seconds % 1) * 1000)
+def _seconds_to_ass_time(seconds: float) -> str:
+    """Конвертує секунди у формат ASS: H:MM:SS.cc"""
+    cs = int((seconds % 1) * 100)   # сотих секунди (ASS використовує .cc, не .ms)
     s = int(seconds) % 60
     m = int(seconds) // 60 % 60
     h = int(seconds) // 3600
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def _word_tuples_to_srt(word_tuples: list, chunk_size: int = 3) -> str:
+def _word_tuples_to_ass(word_tuples: list, chunk_size: int = 3) -> str:
     """
-    word_tuples: список (text, start_seconds, end_seconds) у хронологічному порядку.
-
-    Групує слова по chunk_size на один кадр субтитра — короткі "панчові"
-    фрази, що з'являються синхронно з мовленням (TikTok-стиль), а не
-    цілі речення одночасно на екрані.
+    Групує слова по chunk_size і повертає ASS-вміст.
+    ASS (замість SRT) дає повний контроль над шрифтом, розміром і позицією —
+    subtitles filter в ffmpeg застосовує force_style непередбачувано для SRT.
     """
     words = [w for w in word_tuples if w[0]]
     if not words:
         return ""
+    chunks_raw = [words[i:i + chunk_size] for i in range(0, len(words), chunk_size)]
+    chunks = [
+        (" ".join(w[0] for w in ch), ch[0][1], ch[-1][2])
+        for ch in chunks_raw
+    ]
+    return _chunks_to_ass(chunks)
 
-    lines = []
-    chunks = [words[i:i + chunk_size] for i in range(0, len(words), chunk_size)]
-    for i, chunk in enumerate(chunks, start=1):
-        start = _seconds_to_srt_time(chunk[0][1])
-        end = _seconds_to_srt_time(chunk[-1][2])
-        text = " ".join(w[0] for w in chunk)
-        lines.append(f"{i}\n{start} --> {end}\n{text}\n")
-    return "\n".join(lines)
+
+# Параметри стилю субтитрів (TikTok-стиль)
+_ASS_FONT_NAME  = "Montserrat ExtraBold"
+_ASS_FONT_SIZE  = 40   # px у PlayRes-координатах (1080×1920)
+_ASS_MARGIN_V   = 60   # px від нижнього краю (Alignment=2 → відступ знизу)
+_ASS_OUTLINE    = 4
+_ASS_SHADOW     = 2
+
+
+def _chunks_to_ass(chunks: list) -> str:
+    """
+    chunks: список (text, start_sec, end_sec)
+    Повертає повний ASS-файл з заголовком і подіями.
+    PlayResX/Y задаємо 1080×1920 — відповідає нормалізованому відео.
+    """
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "PlayResX: 1080\n"
+        "PlayResY: 1920\n"
+        "WrapStyle: 0\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,{_ASS_FONT_NAME},{_ASS_FONT_SIZE},"
+        f"&H00FFFFFF,&H00000000,&H80000000,"  # білий текст, чорна обводка, напівпрозорий shadow
+        f"-1,0,0,0,100,100,0,0,1,{_ASS_OUTLINE},{_ASS_SHADOW},"
+        f"2,20,20,{_ASS_MARGIN_V},1\n"       # Alignment=2 (знизу по центру)
+        "\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+    events = []
+    for text, start, end in chunks:
+        s = _seconds_to_ass_time(start)
+        e = _seconds_to_ass_time(end)
+        events.append(f"Dialogue: 0,{s},{e},Default,,0,0,0,,{text}")
+    return header + "\n".join(events) + "\n"
 
 
 def _save_srt(content: str) -> str:
-    path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}.srt")
+    """Зберігає ASS-файл (назва збережена для сумісності з рештою коду)."""
+    path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}.ass")
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
         f.flush()
-        os.fsync(f.fileno())  # гарантуємо, що дані реально на диску до return,
-        # а не тільки в буфері процесу — щоб наступний крок (burn_subtitles)
-        # точно знайшов файл, навіть якщо диск під навантаженням.
+        os.fsync(f.fileno())
     return path

@@ -240,7 +240,7 @@ def normalize_vertical(input_path: str, width: int = 1080, height: int = 1920) -
     return output_path
 
 
-def burn_subtitles(input_path: str, srt_path: str, font_size: int = None, font_color: str = "white") -> str:
+def burn_subtitles(input_path: str, srt_path: str) -> str:
     """
     Накладає субтитри на відео у "TikTok-стилі": жирний білий текст з
     товстою чорною обводкою й тінню (читається на будь-якому фоні),
@@ -267,42 +267,23 @@ def burn_subtitles(input_path: str, srt_path: str, font_size: int = None, font_c
     if os.path.getsize(srt_path) == 0:
         raise RuntimeError(f"SRT файл порожній перед burn-in субтитрів: {srt_path}")
 
-    width, height = _probe_resolution(input_path)
-
-    if font_size is None:
-        font_size = _clamp(round(height / 40), 28, 56)
-    margin_v = _clamp(round(height * 0.12), 100, 260)  # відступ від низу
-    outline = max(3, round(font_size / 12))
-    shadow = max(1, round(font_size / 24))
-
-    # Шлях до папки з шрифтами проекту — передаємо напряму в libass через
-    # fontsdir, щоб не залежати від fontconfig-кешу на Railway (який не
-    # будується під час run-phase і може не мати системних шрифтів).
+    # Шлях до папки з шрифтами — передаємо напряму в libass через fontsdir,
+    # щоб не залежати від fontconfig-кешу на Railway.
     fonts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "fonts")
 
     # Екрануємо шляхи для ffmpeg subtitles filter
     escaped_srt = srt_path.replace("\\", "/").replace(":", "\\:")
     escaped_fonts_dir = fonts_dir.replace("\\", "/").replace(":", "\\:")
 
-    subtitle_style = (
-        "FontName=Montserrat ExtraBold,"
-        f"FontSize={font_size},"
-        f"PrimaryColour=&H00{_color_to_bgr(font_color)},"
-        "OutlineColour=&H00000000,"
-        "BorderStyle=1,"
-        f"Outline={outline},"
-        f"Shadow={shadow},"
-        "Bold=1,"
-        "Alignment=2,"          # знизу по центру
-        f"MarginV={margin_v}"
-    )
-
+    # Стиль задано у самому ASS-файлі (генерується transcriber.py).
+    # force_style не потрібен — це усуває проблему з некоректною інтерпретацією
+    # MarginV у force_style (він трактується як від верху, а не від низу).
     _run(
         ffmpeg
         .input(input_path)
         .output(
             output_path,
-            vf=f"subtitles={escaped_srt}:fontsdir={escaped_fonts_dir}:force_style='{subtitle_style}'",
+            vf=f"subtitles={escaped_srt}:fontsdir={escaped_fonts_dir}",
             vcodec="libx264",
             acodec="copy",
             crf=18,

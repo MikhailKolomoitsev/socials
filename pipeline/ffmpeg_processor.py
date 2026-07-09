@@ -270,16 +270,22 @@ def burn_subtitles(input_path: str, srt_path: str, font_size: int = None, font_c
     width, height = _probe_resolution(input_path)
 
     if font_size is None:
-        font_size = _clamp(round(height / 55), 18, 42)
-    margin_v = _clamp(round(height * 0.22), 140, 380)  # відступ від низу, щоб не лізти під UI TikTok
-    outline = max(2, round(font_size / 14))
-    shadow = max(1, round(font_size / 28))
+        font_size = _clamp(round(height / 40), 28, 56)
+    margin_v = _clamp(round(height * 0.12), 100, 260)  # відступ від низу
+    outline = max(3, round(font_size / 12))
+    shadow = max(1, round(font_size / 24))
 
-    # Екрануємо шлях для ffmpeg subtitles filter
+    # Шлях до папки з шрифтами проекту — передаємо напряму в libass через
+    # fontsdir, щоб не залежати від fontconfig-кешу на Railway (який не
+    # будується під час run-phase і може не мати системних шрифтів).
+    fonts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "fonts")
+
+    # Екрануємо шляхи для ffmpeg subtitles filter
     escaped_srt = srt_path.replace("\\", "/").replace(":", "\\:")
+    escaped_fonts_dir = fonts_dir.replace("\\", "/").replace(":", "\\:")
 
     subtitle_style = (
-        "FontName=DejaVu Sans,"
+        "FontName=Montserrat ExtraBold,"
         f"FontSize={font_size},"
         f"PrimaryColour=&H00{_color_to_bgr(font_color)},"
         "OutlineColour=&H00000000,"
@@ -296,7 +302,7 @@ def burn_subtitles(input_path: str, srt_path: str, font_size: int = None, font_c
         .input(input_path)
         .output(
             output_path,
-            vf=f"subtitles={escaped_srt}:force_style='{subtitle_style}'",
+            vf=f"subtitles={escaped_srt}:fontsdir={escaped_fonts_dir}:force_style='{subtitle_style}'",
             vcodec="libx264",
             acodec="copy",
             crf=18,

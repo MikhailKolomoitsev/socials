@@ -1,7 +1,8 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv()                              # .env — продакшн/базові значення
+load_dotenv(".env.local", override=True)   # .env.local — локальні оверайди (не комітяться)
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")

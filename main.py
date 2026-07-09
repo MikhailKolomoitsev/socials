@@ -434,11 +434,11 @@ async def _process_video_file(
 
         # 1. Видалення пауз
         await msg.edit_text("✂️ Видаляю паузи...")
-        no_silence_path = remove_silence(std_path)
+        no_silence_path = await asyncio.to_thread(remove_silence, std_path)
 
         # 2. Транскрипція → субтитри
         await msg.edit_text("📝 Транскрибую відео...")
-        srt_path, transcript = transcribe_to_srt(no_silence_path)
+        srt_path, transcript = await asyncio.to_thread(transcribe_to_srt, no_silence_path)
 
         # 3. Нормалізація до 9:16
         await msg.edit_text("📐 Приводжу відео до 9:16...")
@@ -497,13 +497,13 @@ async def _process_video_file(
         # 9. Питаємо коли публікувати
         keyboard = _build_schedule_keyboard()
         transcript_line = (
-            f"📝 Транскрипція: _{transcript[:100]}..._\n\n"
+            f"📝 Транскрипція: <i>{html.escape(transcript[:100])}...</i>\n\n"
             if transcript and transcript.strip()
             else "📝 Мовлення не розпізнано (без субтитрів)\n\n"
         )
         await msg.edit_text(
             f"✅ Відео готове!\n\n{transcript_line}Коли публікуємо в TikTok?",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=keyboard,
         )
 
@@ -691,10 +691,10 @@ async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename:
 
         # Клавіатура планування — зберігаємо video_id через inline дані
         keyboard = _build_drive_schedule_keyboard(video_id)
-        transcript_line = f"📝 _{transcript[:100]}..._\n\n" if transcript and transcript.strip() else ""
+        transcript_line = f"📝 <i>{html.escape(transcript[:100])}...</i>\n\n" if transcript and transcript.strip() else ""
         await msg.edit_text(
-            f"✅ «{filename}» готове!\n\n{transcript_line}Коли публікуємо в TikTok?",
-            parse_mode="Markdown",
+            f"✅ «{html.escape(filename)}» готове!\n\n{transcript_line}Коли публікуємо в TikTok?",
+            parse_mode="HTML",
             reply_markup=keyboard,
         )
 

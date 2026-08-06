@@ -133,7 +133,7 @@ def _segments_to_ass(segments: list) -> str:
         end = _field(seg, "end", 0) or 0
         text = (_field(seg, "text", "") or "").strip()
         if text:
-            chunks.append((text, start, end))
+            chunks.append((_render_chunk_text(text.split()), start, end))
     return _chunks_to_ass(chunks)
 
 
@@ -164,7 +164,7 @@ def _word_tuples_to_ass(word_tuples: list, chunk_size: int = 3) -> str:
         return ""
     chunks_raw = [words[i:i + chunk_size] for i in range(0, len(words), chunk_size)]
     chunks = [
-        (" ".join(w[0] for w in ch), ch[0][1], ch[-1][2])
+        (_render_chunk_text([w[0] for w in ch]), ch[0][1], ch[-1][2])
         for ch in chunks_raw
     ]
     return _chunks_to_ass(chunks)
@@ -172,10 +172,66 @@ def _word_tuples_to_ass(word_tuples: list, chunk_size: int = 3) -> str:
 
 # Параметри стилю субтитрів (TikTok-стиль)
 _ASS_FONT_NAME  = "Montserrat ExtraBold"
-_ASS_FONT_SIZE  = 40   # px у PlayRes-координатах (1080×1920)
-_ASS_MARGIN_V   = 60   # px від нижнього краю (Alignment=2 → відступ знизу)
-_ASS_OUTLINE    = 4
+_ASS_FONT_SIZE  = 30   # px у PlayRes-координатах (1080×1920) — було 40, замалий екран робив текст завеликим
+_ASS_MARGIN_V   = 650  # px від нижнього краю (Alignment=2 → відступ знизу) — нижче середини (PlayResY=1920), але з запасом від нижньої панелі TikTok/Reels
+_ASS_OUTLINE    = 3
 _ASS_SHADOW     = 2
+_ASS_HIGHLIGHT_COLOR = "&H00D7FF&"   # золотисто-жовтий (ASS BGR) для ключових слів
+_ASS_DEFAULT_COLOR   = "&H00FFFFFF&"  # білий (з альфа-байтом 00 = непрозорий), повертаємось до нього після виділеного слова
+
+# Короткі українські службові слова, які не виділяємо кольором (не несуть змістового навантаження)
+_UK_STOPWORDS = {
+    "і", "й", "та", "а", "але", "чи", "то", "б", "би", "ж", "же",
+    "не", "ні", "це", "цей", "ця", "ці", "той", "те", "ти", "ви",
+    "я", "ми", "він", "вона", "воно", "вони", "як", "що", "щоб", "коли",
+    "де", "куди", "чому", "тому", "у", "в", "на", "з", "із", "зі", "до",
+    "від", "по", "за", "під", "над", "про", "для", "без", "при", "після",
+    "перед", "між", "через", "усе", "все", "весь", "вся", "тут", "там",
+    "так", "дуже", "ще", "вже", "тільки", "лише", "теж", "також", "ось",
+    "от", "мене", "тебе", "його", "її", "нас", "вас", "їх", "мій", "твій",
+    "наш", "ваш", "свій", "буде", "був", "була", "були", "бути", "є",
+}
+
+
+def _strip_punct(word: str) -> str:
+    return word.strip(".,!?…:;\"'()«»„“”-")
+
+
+def _pick_highlight_word(words: list) -> str | None:
+    """
+    Обирає слово чанка для кольорового виділення — найдовше змістове
+    слово (не службове, не коротке). Якщо в чанку немає такого — нічого
+    не виділяємо (щоб не підсвічувати кожен прийменник).
+    """
+    candidates = [
+        w for w in words
+        if len(_strip_punct(w)) >= 4 and _strip_punct(w).lower() not in _UK_STOPWORDS
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda w: len(_strip_punct(w)))
+
+
+def _render_chunk_text(words: list) -> str:
+    """
+    Формує ASS-текст чанка: ключове слово обгортається кольоровим тегом
+    {\\c...}, решта лишається білою (успадковує PrimaryColour зі стилю).
+    """
+    if not words:
+        return ""
+    highlight = _pick_highlight_word(words)
+    if highlight is None:
+        return " ".join(words)
+
+    parts = []
+    used = False
+    for w in words:
+        if not used and w == highlight:
+            parts.append(f"{{\\c{_ASS_HIGHLIGHT_COLOR}}}{w}{{\\c{_ASS_DEFAULT_COLOR}}}")
+            used = True
+        else:
+            parts.append(w)
+    return " ".join(parts)
 
 
 def _chunks_to_ass(chunks: list) -> str:

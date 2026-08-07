@@ -77,7 +77,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "👋 Привіт! Надішли відео — я його оброблю і запитаю, коли публікувати "
-        "(є кнопка «🚀 TikTok + Instagram зараз» — одразу на обидві платформи).\n\n"
+        "(окремі кнопки «🔴 TikTok зараз» і «📸 Instagram зараз» — публікуй на "
+        "одну платформу чи на обидві, незалежно одна від одної).\n\n"
         "Якщо відео >20MB — надішли посилання:\n"
         "`/process_url https://...`\n\n"
         "Надішли кілька фото одним альбомом — запропоную опублікувати їх як "
@@ -242,7 +243,7 @@ async def cmd_test_ig(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"container_id: {result['container_id']} (тестовий, НЕ опубліковано — "
         "сам згорить за ~24 год)\n\n"
         "Токен валідний, дозволи є, Graph API доступний. Можеш сміливо "
-        "користуватись «🚀 TikTok + Instagram зараз» або /publish_ig."
+        "користуватись кнопкою «📸 Instagram зараз» або /publish_ig."
     )
 
 
@@ -883,19 +884,22 @@ def _build_schedule_keyboard(video_id: int) -> InlineKeyboardMarkup:
         callback_data = f"schedule_tiktok:{video_id}:{scheduled.isoformat()}"
         buttons.append([InlineKeyboardButton(label, callback_data=callback_data)])
 
-    buttons.append([InlineKeyboardButton("🔴 Зараз", callback_data=f"schedule_tiktok:{video_id}:now")])
+    buttons.append([InlineKeyboardButton("🔴 TikTok зараз", callback_data=f"schedule_tiktok:{video_id}:now")])
     buttons.append([InlineKeyboardButton(
-        "🚀 TikTok + Instagram зараз", callback_data=f"schedule_both:{video_id}",
+        "📸 Instagram зараз", callback_data=f"schedule_instagram:{video_id}",
     )])
     return InlineKeyboardMarkup(buttons)
 
 
-async def handle_schedule_both_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_schedule_instagram_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Ставить відео в чергу ОДРАЗУ на обидві платформи: TikTok (у чернетки —
-    публікацію все одно довершує власник вручну в застосунку) і Instagram
-    Reels (публікується по-справжньому автоматично через Graph API, з
-    власним підписом, згенерованим під Instagram — не адаптованим з TikTok).
+    Ставить відео в чергу ОДРАЗУ, лише на Instagram Reels (окремо від
+    TikTok — див. handle_schedule_callback для TikTok-only і цей хендлер
+    також обробляє callback_data з Drive-флоу, де формат ідентичний:
+    "schedule_instagram:<video_id>" / "schedule_drive_instagram:<video_id>").
+
+    Публікується по-справжньому автоматично через Graph API, з власним
+    підписом, згенерованим під Instagram (не адаптованим з TikTok).
     """
     query = update.callback_query
     await query.answer()
@@ -906,14 +910,11 @@ async def handle_schedule_both_callback(update: Update, context: ContextTypes.DE
     _, video_id_str = query.data.split(":", 1)
     video_id = int(video_id_str)
 
-    scheduled_at = datetime.now()
-    db.enqueue(video_id, "tiktok", scheduled_at)
-    db.enqueue(video_id, "instagram", scheduled_at)
+    db.enqueue(video_id, "instagram", datetime.now())
 
     await query.edit_message_text(
-        "✅ Поставлено в чергу зараз на ОБИДВІ платформи:\n"
-        "• TikTok — потрапить у чернетки, відкрий застосунок і натисни «Опублікувати»\n"
-        "• Instagram Reels — опублікується автоматично за кілька хвилин (справжня публікація через Graph API)"
+        "✅ Поставлено в чергу на Instagram Reels зараз.\n"
+        "Опублікується автоматично за кілька хвилин (справжня публікація через Graph API)."
     )
 
 
@@ -1115,37 +1116,14 @@ def _build_drive_schedule_keyboard(video_id: int) -> InlineKeyboardMarkup:
             callback_data=f"schedule_drive:{video_id}:{scheduled.isoformat()}",
         )])
     buttons.append([InlineKeyboardButton(
-        "🔴 Зараз",
+        "🔴 TikTok зараз",
         callback_data=f"schedule_drive:{video_id}:now",
     )])
     buttons.append([InlineKeyboardButton(
-        "🚀 TikTok + Instagram зараз",
-        callback_data=f"schedule_drive_both:{video_id}",
+        "📸 Instagram зараз",
+        callback_data=f"schedule_drive_instagram:{video_id}",
     )])
     return InlineKeyboardMarkup(buttons)
-
-
-async def handle_drive_schedule_both_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Аналог handle_schedule_both_callback, але для відео з Google Drive
-    (video_id вбудований у callback_data, а не в user_data)."""
-    query = update.callback_query
-    await query.answer()
-
-    if not is_allowed(update):
-        return
-
-    _, video_id_str = query.data.split(":", 1)
-    video_id = int(video_id_str)
-
-    scheduled_at = datetime.now()
-    db.enqueue(video_id, "tiktok", scheduled_at)
-    db.enqueue(video_id, "instagram", scheduled_at)
-
-    await query.edit_message_text(
-        "✅ Поставлено в чергу зараз на ОБИДВІ платформи:\n"
-        "• TikTok — потрапить у чернетки, відкрий застосунок і натисни «Опублікувати»\n"
-        "• Instagram Reels — опублікується автоматично за кілька хвилин (справжня публікація через Graph API)"
-    )
 
 
 async def handle_drive_schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1198,10 +1176,10 @@ def main():
     app.add_handler(CommandHandler("scan_drive", cmd_scan_drive))
     app.add_handler(CallbackQueryHandler(handle_drive_process_callback, pattern=r"^drive_process:"))
     app.add_handler(CallbackQueryHandler(handle_drive_schedule_callback, pattern=r"^schedule_drive:"))
-    app.add_handler(CallbackQueryHandler(handle_drive_schedule_both_callback, pattern=r"^schedule_drive_both:"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_instagram_callback, pattern=r"^schedule_drive_instagram:"))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(CallbackQueryHandler(handle_schedule_callback, pattern=r"^schedule_tiktok:"))
-    app.add_handler(CallbackQueryHandler(handle_schedule_both_callback, pattern=r"^schedule_both:"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_instagram_callback, pattern=r"^schedule_instagram:"))
     app.add_handler(CallbackQueryHandler(handle_publish_ig_callback, pattern=r"^publish_ig:"))
     app.add_handler(CallbackQueryHandler(handle_dm_blast_callback, pattern=r"^dm_blast_(confirm|cancel)$"))
     app.add_handler(CommandHandler("nocap", cmd_nocap))

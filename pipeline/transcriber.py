@@ -4,6 +4,7 @@
 """
 
 import os
+import random
 import uuid
 from config import TMP_DIR, OPENAI_API_KEY, ASSEMBLYAI_API_KEY
 from pipeline.ffmpeg_processor import extract_audio
@@ -153,16 +154,16 @@ def _seconds_to_ass_time(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def _word_tuples_to_ass(word_tuples: list, chunk_size: int = 3) -> str:
+def _word_tuples_to_ass(word_tuples: list) -> str:
     """
-    Групує слова по chunk_size і повертає ASS-вміст.
+    Групує слова в чанки ЗМІННОГО розміру (1-3 слова) — динамічний ритм.
     ASS (замість SRT) дає повний контроль над шрифтом, розміром і позицією —
     subtitles filter в ffmpeg застосовує force_style непередбачувано для SRT.
     """
     words = [w for w in word_tuples if w[0]]
     if not words:
         return ""
-    chunks_raw = [words[i:i + chunk_size] for i in range(0, len(words), chunk_size)]
+    chunks_raw = _dynamic_chunks(words)
     chunks = [
         (_render_chunk_text([w[0] for w in ch]), ch[0][1], ch[-1][2])
         for ch in chunks_raw
@@ -170,9 +171,36 @@ def _word_tuples_to_ass(word_tuples: list, chunk_size: int = 3) -> str:
     return _chunks_to_ass(chunks)
 
 
+def _dynamic_chunks(words: list, solo_probability: float = 0.4) -> list:
+    """
+    Розбиває список (word, start, end) на чанки змінного розміру 1-3 слова —
+    замість фіксованих чанків по 3, які виглядають монотонно.
+
+    Логіка: змістове слово (довге, не службове — те саме правило, що й для
+    кольорового виділення в _pick_highlight_word) з імовірністю
+    solo_probability показується САМЕ, одним словом — "панч"-ефект. Інакше
+    слова групуються по 2-3 разом, як типовий TikTok-стиль субтитрів.
+    """
+    chunks = []
+    i, n = 0, len(words)
+    while i < n:
+        word_text = _strip_punct(words[i][0])
+        is_content_word = len(word_text) >= 5 and word_text.lower() not in _UK_STOPWORDS
+
+        if is_content_word and random.random() < solo_probability:
+            size = 1
+        else:
+            size = random.choice([2, 3])
+
+        size = min(size, n - i)
+        chunks.append(words[i:i + size])
+        i += size
+    return chunks
+
+
 # Параметри стилю субтитрів (TikTok-стиль)
 _ASS_FONT_NAME  = "Montserrat ExtraBold"
-_ASS_FONT_SIZE  = 38   # px у PlayRes-координатах (1080×1920) — було 32
+_ASS_FONT_SIZE  = 52   # px у PlayRes-координатах (1080×1920) — було 38 (×1.37)
 _ASS_MARGIN_V   = 500  # px від нижнього краю (Alignment=2 → відступ знизу) — було 550, опущено ще нижче
 _ASS_OUTLINE    = 3
 _ASS_SHADOW     = 2

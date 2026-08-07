@@ -29,6 +29,7 @@ import os
 import threading
 import uuid
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests as http_requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -46,6 +47,7 @@ import db
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, TMP_DIR,
     TIKTOK_PUBLISH_TIMES, TIKTOK_DAILY_LIMIT, INSTAGRAM_PUBLISH_HOUR,
+    INSTAGRAM_REELS_HOUR,
 )
 from pipeline.ffmpeg_processor import to_standard_mp4, remove_silence, normalize_vertical, burn_subtitles, extract_frame
 from pipeline.transcriber import transcribe_words, build_ass_for_style, save_ass
@@ -77,8 +79,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "👋 Привіт! Надішли відео — я його оброблю і запитаю, коли публікувати "
-        "(окремі кнопки «🔴 TikTok зараз» і «📸 Instagram зараз» — публікуй на "
-        "одну платформу чи на обидві, незалежно одна від одної).\n\n"
+        "(окремі кнопки «🔴 TikTok зараз» і «📸 Instagram (оптимальний час)» — "
+        "TikTok публікується в чернетки одразу, Instagram Reels стає в чергу "
+        "на найближчий вечірній пік для Європи, публікуй незалежно одне від одного).\n\n"
         "Якщо відео >20MB — надішли посилання:\n"
         "`/process_url https://...`\n\n"
         "Надішли кілька фото одним альбомом — запропоную опублікувати їх як "
@@ -243,7 +246,7 @@ async def cmd_test_ig(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"container_id: {result['container_id']} (тестовий, НЕ опубліковано — "
         "сам згорить за ~24 год)\n\n"
         "Токен валідний, дозволи є, Graph API доступний. Можеш сміливо "
-        "користуватись кнопкою «📸 Instagram зараз» або /publish_ig."
+        "користуватись кнопкою «📸 Instagram (оптимальний час)» або /publish_ig."
     )
 
 
@@ -537,27 +540,19 @@ async def handle_carousel_caption_text(update: Update, context: ContextTypes.DEF
 def _build_carousel_schedule_keyboard(carousel_id: int) -> InlineKeyboardMarkup:
     """Кнопки планування для каруселі: дефолтна година з INSTAGRAM_PUBLISH_HOUR,
     ті самі слоти що й для TikTok (для зручності — один спільний ритм публікацій),
-    і "Зараз"."""
-    buttons = []
-    now = datetime.now()
-
-    default_time = now.replace(hour=INSTAGRAM_PUBLISH_HOUR, minute=0, second=0, microsecond=0)
-    if default_time <= now:
-        default_time += timedelta(days=1)
-    day_label = "завтра" if default_time.date() > now.date() else "сьогодні"
-    buttons.append([InlineKeyboardButton(
-        f"🌅 {day_label} о {INSTAGRAM_PUBLISH_HOUR:02d}:00",
-        callback_data=f"schedule_carousel:{carousel_id}:{default_time.isoformat()}",
-    )])
+    і "Зараз". Час у callback_data — "HH:MM" за Києвом як є, конвертація в
+    UTC у момент кліку (handle_carousel_schedule_callback через
+    _next_kyiv_time), а не тут — щоб кнопка не "застарівала"."""
+    default_time_str = f"{INSTAGRAM_PUBLISH_HOUR:02d}:00"
+    buttons = [[InlineKeyboardButton(
+        f"🌅 {default_time_str}",
+        callback_data=f"schedule_carousel:{carousel_id}:{default_time_str}",
+    )]]
 
     for time_str in TIKTOK_PUBLISH_TIMES:
-        h, m = map(int, time_str.split(":"))
-        scheduled = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if scheduled <= now:
-            scheduled += timedelta(days=1)
         buttons.append([InlineKeyboardButton(
             f"🕐 {time_str}",
-            callback_data=f"schedule_carousel:{carousel_id}:{scheduled.isoformat()}",
+            callback_data=f"schedule_carousel:{carousel_id}:{time_str}",
         )])
 
     buttons.append([InlineKeyboardButton(
@@ -580,8 +575,9 @@ async def handle_carousel_schedule_callback(update: Update, context: ContextType
         scheduled_at = datetime.now()
         label = "зараз"
     else:
-        scheduled_at = datetime.fromisoformat(time_part)
-        label = scheduled_at.strftime("%H:%M %d.%m")
+        h, m = map(int, time_part.split(":"))
+        scheduled_at, day_label = _next_kyiv_time(h, m)
+        label = f"{time_part} за Києвом ({day_label})"
 
     db.enqueue_carousel(carousel_id, scheduled_at)
 
@@ -870,33 +866,105 @@ def _build_schedule_keyboard(video_id: int) -> InlineKeyboardMarkup:
     юзера: якщо обробляється кілька відео паралельно (два надіслані поспіль),
     останнє оброблене перезаписувало б слот, і кнопки під СТАРІШИМ
     повідомленням почали б планувати НОВІШЕ відео. Вшивання id прибирає цю
-    залежність від порядку обробки."""
-    buttons = []
-    now = datetime.now()
+    залежність від порядку обробки.
 
-    for time_str in TIKTOK_PUBLISH_TIMES:
-        h, m = map(int, time_str.split(":"))
-        scheduled = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if scheduled <= now:
-            scheduled += timedelta(days=1)
-
-        label = f"🕐 {time_str}"
-        callback_data = f"schedule_tiktok:{video_id}:{scheduled.isoformat()}"
-        buttons.append([InlineKeyboardButton(label, callback_data=callback_data)])
-
+    callback_data несе "HH:MM" за Києвом як є (не заздалегідь порахований
+    UTC ISO-таймстемп) — конвертація в UTC відбувається в момент КЛІКУ, у
+    handle_schedule_callback через _next_kyiv_time(), а не тут. Так кнопка
+    лишається правильною, навіть якщо провисить непроклацаною кілька годин
+    (інакше "сьогодні о 09:00" міг би стати минулим/наступним днем ще до
+    того, як по ній клікнули)."""
+    buttons = [
+        [InlineKeyboardButton(f"🕐 {time_str}", callback_data=f"schedule_tiktok:{video_id}:{time_str}")]
+        for time_str in TIKTOK_PUBLISH_TIMES
+    ]
     buttons.append([InlineKeyboardButton("🔴 TikTok зараз", callback_data=f"schedule_tiktok:{video_id}:now")])
     buttons.append([InlineKeyboardButton(
-        "📸 Instagram зараз", callback_data=f"schedule_instagram:{video_id}",
+        "📸 Instagram (оптимальний час)", callback_data=f"schedule_instagram:{video_id}",
     )])
     return InlineKeyboardMarkup(buttons)
 
 
+_KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+
+def _next_kyiv_time(hour: int, minute: int = 0) -> tuple:
+    """
+    Найближчий момент, коли за Києвом настане hour:minute (сьогодні, якщо
+    ще не минуло, інакше завтра).
+
+    Повертає (scheduled_at_utc_naive, day_label):
+      scheduled_at_utc_naive — НАЇВНИЙ datetime у UTC (без tzinfo), щоб
+        узгоджуватись з рештою черги: db.enqueue зберігає .isoformat(), а
+        SQLite datetime('now') у db.get_pending_queue() завжди UTC —
+        незалежно від того, у якому часовому поясі фактично працює
+        контейнер на Railway (типово UTC за замовчуванням, без якого час,
+        заданий у TIKTOK_PUBLISH_TIMES/INSTAGRAM_PUBLISH_HOUR/
+        INSTAGRAM_REELS_HOUR, фактично зсувався б на 2-3 год від задуманого
+        київського).
+      day_label — "сьогодні" або "завтра", для повідомлення в чаті.
+    """
+    now_kyiv = datetime.now(_KYIV_TZ)
+    target_kyiv = now_kyiv.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    day_label = "сьогодні"
+    if target_kyiv <= now_kyiv:
+        target_kyiv += timedelta(days=1)
+        day_label = "завтра"
+    scheduled_at_utc = target_kyiv.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    return scheduled_at_utc, day_label
+
+
+def _next_optimal_instagram_time() -> tuple:
+    """
+    Наступний оптимальний час публікації Reels для європейської аудиторії —
+    Київ/Берлін (Київ завжди на 1 год попереду Берліна — обидва йдуть за
+    єдиним DST-розкладом ЄС, тож досить рахувати відносно одного поясу).
+    Година береться з config.INSTAGRAM_REELS_HOUR (за замовчуванням 19:00 за
+    Києвом = 18:00 за Берліном — вечірній пік охоплення Reels за даними 2026
+    року, Buffer/Sprout Social/SocialChamp).
+
+    Повертає (scheduled_at_utc_naive, label) — див. _next_kyiv_time().
+    """
+    scheduled_at_utc, day_label = _next_kyiv_time(INSTAGRAM_REELS_HOUR)
+    label = f"{INSTAGRAM_REELS_HOUR:02d}:00 за Києвом ({day_label})"
+    return scheduled_at_utc, label
+
+
+async def _strip_keyboard_buttons(query, prefixes: tuple):
+    """
+    Прибирає з клавіатури повідомлення ТІЛЬКИ кнопки, чий callback_data
+    починається з одного з prefixes — решта (кнопки іншої платформи)
+    лишається активною.
+
+    Викликається ПІСЛЯ enqueue, ЗАМІСТЬ query.edit_message_text(): edit_message_text
+    стирає всю клавіатуру одразу (стара поведінка "🚀 both" — коли обидві
+    платформи ставились в чергу одним натисканням, це було ОК). Тепер
+    TikTok і Instagram незалежні кнопки, тож натискання однієї не повинно
+    ховати іншу — власник може натиснути другу пізніше з того самого
+    повідомлення.
+    """
+    old_markup = query.message.reply_markup
+    if not old_markup:
+        return
+    new_rows = [
+        row for row in old_markup.inline_keyboard
+        if not any(btn.callback_data and btn.callback_data.startswith(prefixes) for btn in row)
+    ]
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup(new_rows) if new_rows else None
+        )
+    except TgBadRequest:
+        pass  # повідомлення вже змінилось/застаріле — не критично
+
+
 async def handle_schedule_instagram_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Ставить відео в чергу ОДРАЗУ, лише на Instagram Reels (окремо від
-    TikTok — див. handle_schedule_callback для TikTok-only і цей хендлер
-    також обробляє callback_data з Drive-флоу, де формат ідентичний:
-    "schedule_instagram:<video_id>" / "schedule_drive_instagram:<video_id>").
+    Ставить відео в чергу на Instagram Reels — НЕ одразу, а на найближчий
+    оптимальний час для європейської аудиторії (Київ/Берлін, див.
+    _next_optimal_instagram_time). Окремо від TikTok. Один хендлер обробляє
+    callback_data і зі звичайного флоу, і з Drive-флоу — формат ідентичний:
+    "schedule_instagram:<video_id>" / "schedule_drive_instagram:<video_id>".
 
     Публікується по-справжньому автоматично через Graph API, з власним
     підписом, згенерованим під Instagram (не адаптованим з TikTok).
@@ -910,11 +978,16 @@ async def handle_schedule_instagram_callback(update: Update, context: ContextTyp
     _, video_id_str = query.data.split(":", 1)
     video_id = int(video_id_str)
 
-    db.enqueue(video_id, "instagram", datetime.now())
+    scheduled_at, label = _next_optimal_instagram_time()
+    db.enqueue(video_id, "instagram", scheduled_at)
 
-    await query.edit_message_text(
-        "✅ Поставлено в чергу на Instagram Reels зараз.\n"
-        "Опублікується автоматично за кілька хвилин (справжня публікація через Graph API)."
+    # Прибираємо тільки Instagram-кнопку — TikTok-кнопки (часові слоти й
+    # "🔴 TikTok зараз") лишаються активними на цьому ж повідомленні.
+    await _strip_keyboard_buttons(query, ("schedule_instagram:", "schedule_drive_instagram:"))
+
+    await query.message.reply_text(
+        f"✅ Instagram Reels: поставлено в чергу на {label}.\n"
+        "Опублікується автоматично в цей час (справжня публікація через Graph API)."
     )
 
 
@@ -925,7 +998,7 @@ async def handle_schedule_callback(update: Update, context: ContextTypes.DEFAULT
     if not is_allowed(update):
         return
 
-    data = query.data  # "schedule_tiktok:<video_id>:2026-06-11T09:00:00" або "...:now"
+    data = query.data  # "schedule_tiktok:<video_id>:09:00" або "...:now"
     _, video_id_str, time_part = data.split(":", 2)
     video_id = int(video_id_str)
 
@@ -933,12 +1006,18 @@ async def handle_schedule_callback(update: Update, context: ContextTypes.DEFAULT
         scheduled_at = datetime.now()
         label = "зараз"
     else:
-        scheduled_at = datetime.fromisoformat(time_part)
-        label = scheduled_at.strftime("%H:%M")
+        h, m = map(int, time_part.split(":"))
+        scheduled_at, day_label = _next_kyiv_time(h, m)
+        label = f"{time_part} за Києвом ({day_label})"
 
     db.enqueue(video_id, "tiktok", scheduled_at)
 
-    await query.edit_message_text(
+    # Прибираємо TikTok-кнопки (усі часові слоти + "зараз") — TikTok уже
+    # заплановано, повторний вибір іншого часу тут не має сенсу. Instagram-
+    # кнопка лишається активною на цьому ж повідомленні.
+    await _strip_keyboard_buttons(query, ("schedule_tiktok:",))
+
+    await query.message.reply_text(
         f"✅ Поставлено в чергу на TikTok о {label}.\n"
         "Відео потрапить у твої TikTok-чернетки — відкрий TikTok і натисни "
         "\"Опублікувати\". Коли побачиш, що відео вибухнуло, скористайся "
@@ -1103,24 +1182,19 @@ async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename:
 
 
 def _build_drive_schedule_keyboard(video_id: int) -> InlineKeyboardMarkup:
-    """Кнопки планування для відео з Drive (video_id вбудований у callback_data)."""
-    buttons = []
-    now = datetime.now()
-    for time_str in TIKTOK_PUBLISH_TIMES:
-        h, m = map(int, time_str.split(":"))
-        scheduled = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if scheduled <= now:
-            scheduled += timedelta(days=1)
-        buttons.append([InlineKeyboardButton(
-            f"🕐 {time_str}",
-            callback_data=f"schedule_drive:{video_id}:{scheduled.isoformat()}",
-        )])
+    """Кнопки планування для відео з Drive (video_id вбудований у callback_data).
+    Час у callback_data — "HH:MM" за Києвом як є, конвертація в UTC у
+    момент кліку (див. коментар у _build_schedule_keyboard)."""
+    buttons = [
+        [InlineKeyboardButton(f"🕐 {time_str}", callback_data=f"schedule_drive:{video_id}:{time_str}")]
+        for time_str in TIKTOK_PUBLISH_TIMES
+    ]
     buttons.append([InlineKeyboardButton(
         "🔴 TikTok зараз",
         callback_data=f"schedule_drive:{video_id}:now",
     )])
     buttons.append([InlineKeyboardButton(
-        "📸 Instagram зараз",
+        "📸 Instagram (оптимальний час)",
         callback_data=f"schedule_drive_instagram:{video_id}",
     )])
     return InlineKeyboardMarkup(buttons)
@@ -1140,11 +1214,17 @@ async def handle_drive_schedule_callback(update: Update, context: ContextTypes.D
         scheduled_at = datetime.now()
         label = "зараз"
     else:
-        scheduled_at = datetime.fromisoformat(time_part)
-        label = scheduled_at.strftime("%H:%M")
+        h, m = map(int, time_part.split(":"))
+        scheduled_at, day_label = _next_kyiv_time(h, m)
+        label = f"{time_part} за Києвом ({day_label})"
 
     db.enqueue(video_id, "tiktok", scheduled_at)
-    await query.edit_message_text(
+
+    # Прибираємо тільки TikTok-кнопки цього повідомлення — Instagram-кнопка
+    # лишається активною (незалежна публікація, як і в handle_schedule_callback).
+    await _strip_keyboard_buttons(query, ("schedule_drive:",))
+
+    await query.message.reply_text(
         f"✅ Поставлено в чергу на TikTok о {label}.\n"
         "Відео потрапить у твої TikTok-чернетки — відкрий TikTok і натисни «Опублікувати»."
     )

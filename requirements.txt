@@ -13,3 +13,4 @@ Flask==3.0.3
 fal-client==0.5.9
 google-api-python-client==2.131.0
 google-auth==2.29.0
+tzdata==2024.1

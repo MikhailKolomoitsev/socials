@@ -54,7 +54,7 @@ from pipeline.caption_generator import generate_caption
 from pipeline.uploader import upload_file
 from scheduler.queue_runner import run as queue_runner_run
 from webapp.server import start_in_background as start_webapp
-from publishers.instagram import publish_reel, adapt_caption_for_instagram, get_valid_token_and_user_id
+from publishers.instagram import publish_reel, adapt_caption_for_instagram, get_valid_token_and_user_id, test_connection as ig_test_connection
 from publishers.instagram_dm import list_dm_candidates, run_broadcast
 from publishers.tiktok import list_recent_public_videos as tiktok_list_recent_public_videos
 from pipeline.drive_watcher import list_all_videos, download_file as drive_download, is_processing, mark_processing, unmark_processing, extract_file_id
@@ -76,7 +76,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     await update.message.reply_text(
-        "👋 Привіт! Надішли відео — я його оброблю і поставлю в чергу для публікації.\n\n"
+        "👋 Привіт! Надішли відео — я його оброблю і запитаю, коли публікувати "
+        "(є кнопка «🚀 TikTok + Instagram зараз» — одразу на обидві платформи).\n\n"
         "Якщо відео >20MB — надішли посилання:\n"
         "`/process_url https://...`\n\n"
         "Надішли кілька фото одним альбомом — запропоную опублікувати їх як "
@@ -85,6 +86,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/queue — черга\n"
         "/publish_ig — опублікувати в Instagram відео, яке вже \"вибухнуло\" в TikTok "
         "(з реальними переглядами, якщо відео вже опубліковане в TikTok вручну)\n"
+        "/test_ig — безпечна перевірка, чи працює публікація в Instagram (нічого не публікує)\n"
         "/dm_blast <текст> — одноразова розсилка в Instagram Direct усім, хто вже писав",
         parse_mode="Markdown",
     )
@@ -209,6 +211,39 @@ def _format_views(n: int) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.1f}K"
     return str(n)
+
+
+async def cmd_test_ig(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Безпечна перевірка: чи ПРАЦЮВАТИМЕ публікація в Instagram — БЕЗ реальної
+    публікації (нічого не з'явиться на профілі/в стрічці). Див.
+    publishers/instagram.py:test_connection() для деталей, що саме
+    перевіряється.
+    """
+    if not is_allowed(update):
+        return
+
+    msg = await update.message.reply_text("🧪 Перевіряю підключення до Instagram Graph API (нічого не публікую)...")
+
+    try:
+        result = await asyncio.to_thread(ig_test_connection)
+    except Exception as e:
+        logger.error(f"Instagram test_connection failed: {e}", exc_info=True)
+        await msg.edit_text(
+            f"❌ Публікація в Instagram НЕ спрацює зараз:\n\n{e}\n\n"
+            "Найчастіша причина — токен ще не отриманий/протух: пройди "
+            "/auth/instagram/login."
+        )
+        return
+
+    await msg.edit_text(
+        "✅ Публікація в Instagram спрацює.\n\n"
+        f"ig_user_id: {result['ig_user_id']}\n"
+        f"container_id: {result['container_id']} (тестовий, НЕ опубліковано — "
+        "сам згорить за ~24 год)\n\n"
+        "Токен валідний, дозволи є, Graph API доступний. Можеш сміливо "
+        "користуватись «🚀 TikTok + Instagram зараз» або /publish_ig."
+    )
 
 
 async def handle_publish_ig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -822,7 +857,40 @@ def _build_schedule_keyboard() -> InlineKeyboardMarkup:
         buttons.append([InlineKeyboardButton(label, callback_data=callback_data)])
 
     buttons.append([InlineKeyboardButton("🔴 Зараз", callback_data="schedule_tiktok:now")])
+    buttons.append([InlineKeyboardButton(
+        "🚀 TikTok + Instagram зараз", callback_data="schedule_both:now",
+    )])
     return InlineKeyboardMarkup(buttons)
+
+
+async def handle_schedule_both_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ставить відео в чергу ОДРАЗУ на обидві платформи: TikTok (у чернетки —
+    публікацію все одно довершує власник вручну в застосунку) і Instagram
+    Reels (публікується по-справжньому автоматично через Graph API, з
+    власним підписом, згенерованим під Instagram — не адаптованим з TikTok).
+    """
+    query = update.callback_query
+    await query.answer()
+
+    if not is_allowed(update):
+        return
+
+    video_id = context.user_data.get("pending_video_id")
+    if not video_id:
+        await query.edit_message_text("❌ Не знайдено відео. Надішли його знову.")
+        return
+
+    scheduled_at = datetime.now()
+    db.enqueue(video_id, "tiktok", scheduled_at)
+    db.enqueue(video_id, "instagram", scheduled_at)
+    context.user_data.pop("pending_video_id", None)
+
+    await query.edit_message_text(
+        "✅ Поставлено в чергу зараз на ОБИДВІ платформи:\n"
+        "• TikTok — потрапить у чернетки, відкрий застосунок і натисни «Опублікувати»\n"
+        "• Instagram Reels — опублікується автоматично за кілька хвилин (справжня публікація через Graph API)"
+    )
 
 
 async def handle_schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1015,7 +1083,34 @@ def _build_drive_schedule_keyboard(video_id: int) -> InlineKeyboardMarkup:
         "🔴 Зараз",
         callback_data=f"schedule_drive:{video_id}:now",
     )])
+    buttons.append([InlineKeyboardButton(
+        "🚀 TikTok + Instagram зараз",
+        callback_data=f"schedule_drive_both:{video_id}",
+    )])
     return InlineKeyboardMarkup(buttons)
+
+
+async def handle_drive_schedule_both_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Аналог handle_schedule_both_callback, але для відео з Google Drive
+    (video_id вбудований у callback_data, а не в user_data)."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_allowed(update):
+        return
+
+    _, video_id_str = query.data.split(":", 1)
+    video_id = int(video_id_str)
+
+    scheduled_at = datetime.now()
+    db.enqueue(video_id, "tiktok", scheduled_at)
+    db.enqueue(video_id, "instagram", scheduled_at)
+
+    await query.edit_message_text(
+        "✅ Поставлено в чергу зараз на ОБИДВІ платформи:\n"
+        "• TikTok — потрапить у чернетки, відкрий застосунок і натисни «Опублікувати»\n"
+        "• Instagram Reels — опублікується автоматично за кілька хвилин (справжня публікація через Graph API)"
+    )
 
 
 async def handle_drive_schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1062,13 +1157,16 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("publish_ig", cmd_publish_ig))
+    app.add_handler(CommandHandler("test_ig", cmd_test_ig))
     app.add_handler(CommandHandler("dm_blast", cmd_dm_blast))
     app.add_handler(CommandHandler("process_url", cmd_process_url))
     app.add_handler(CommandHandler("scan_drive", cmd_scan_drive))
     app.add_handler(CallbackQueryHandler(handle_drive_process_callback, pattern=r"^drive_process:"))
     app.add_handler(CallbackQueryHandler(handle_drive_schedule_callback, pattern=r"^schedule_drive:"))
+    app.add_handler(CallbackQueryHandler(handle_drive_schedule_both_callback, pattern=r"^schedule_drive_both:"))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(CallbackQueryHandler(handle_schedule_callback, pattern=r"^schedule_tiktok:"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_both_callback, pattern=r"^schedule_both:"))
     app.add_handler(CallbackQueryHandler(handle_publish_ig_callback, pattern=r"^publish_ig:"))
     app.add_handler(CallbackQueryHandler(handle_dm_blast_callback, pattern=r"^dm_blast_(confirm|cancel)$"))
     app.add_handler(CommandHandler("nocap", cmd_nocap))

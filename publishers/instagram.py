@@ -82,6 +82,47 @@ def get_valid_token_and_user_id():
     return _get_valid_token_and_user_id()
 
 
+def test_connection(image_url: str = "https://picsum.photos/1080/1920") -> dict:
+    """
+    Перевіряє, чи ПРАЦЮВАТИМЕ публікація в Instagram — БЕЗ реальної
+    публікації. Створює media container (крок 1 з publish_reel/publish_carousel)
+    і чекає, поки Instagram його обробить, але НІКОЛИ не викликає
+    media_publish — тобто нічого публічно не постить і не з'являється в
+    стрічці/на профілі. Контейнер, що не опубліковано, сам "згорає" за
+    ~24 години на боці Instagram.
+
+    Підтверджує: токен валідний, дозволи (instagram_business_content_publish)
+    видані, ig_user_id коректний, і Graph API може отримати доступ до наданого
+    URL. Саме ці чотири речі й ламаються найчастіше — сама публікація (останній
+    крок, media_publish) технічно ідентична й майже ніколи не падає окремо.
+
+    Args:
+        image_url: публічний URL тестового зображення (за замовчуванням —
+                    випадкове фото з picsum.photos, щоб не залежати від S3)
+
+    Returns:
+        {"ok": True, "ig_user_id": ..., "container_id": ...}
+    Raises:
+        RuntimeError з точним текстом помилки від Meta, якщо щось не так.
+    """
+    access_token, ig_user_id = _get_valid_token_and_user_id()
+
+    resp = requests.post(
+        f"{GRAPH_URL}/{ig_user_id}/media",
+        params={"image_url": image_url, "access_token": access_token},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "id" not in data:
+        raise RuntimeError(f"Instagram test container error: {data}")
+
+    container_id = data["id"]
+    _wait_for_container(container_id, access_token)
+
+    return {"ok": True, "ig_user_id": ig_user_id, "container_id": container_id}
+
+
 def publish_reel(video_url: str, caption: str, cover_url: str = None) -> str:
     """
     Публікує Reels в Instagram (двоетапний процес: create → publish).

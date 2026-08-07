@@ -48,7 +48,7 @@ from config import (
     TIKTOK_PUBLISH_TIMES, TIKTOK_DAILY_LIMIT, INSTAGRAM_PUBLISH_HOUR,
 )
 from pipeline.ffmpeg_processor import to_standard_mp4, remove_silence, normalize_vertical, burn_subtitles, extract_frame
-from pipeline.transcriber import transcribe_to_srt
+from pipeline.transcriber import transcribe_words, build_ass_for_style, save_ass
 from pipeline.cover_generator import generate_cover_ai as generate_cover
 from pipeline.caption_generator import generate_caption
 from pipeline.uploader import upload_file
@@ -262,9 +262,13 @@ async def handle_publish_ig_callback(update: Update, context: ContextTypes.DEFAU
     await query.edit_message_text("⏳ Публікую в Instagram Reels...")
 
     insta_caption = adapt_caption_for_instagram(video.get("tiktok_caption", ""))
+    # s3_url_instagram — варіант з іншим стилем субтитрів (не TikTok-стиль),
+    # щоб Instagram не порахував відео дублікатом TikTok-публікації і не
+    # порізав охоплення. Fallback на s3_url для старих записів без варіанту.
+    video_url = video.get("s3_url_instagram") or video["s3_url"]
     try:
         media_id = publish_reel(
-            video_url=video["s3_url"],
+            video_url=video_url,
             caption=insta_caption,
             cover_url=video.get("cover_s3_url"),
         )
@@ -743,8 +747,8 @@ async def _process_video_file(
     std_path = None
     no_silence_path = None
     vertical_path = None
-    srt_path = None
-    final_video_path = None
+    ass_paths = []
+    final_video_paths = {}
     frame_path = None
     cover_path = None
 
@@ -757,36 +761,52 @@ async def _process_video_file(
         await msg.edit_text("✂️ Видаляю паузи...")
         no_silence_path = await asyncio.to_thread(remove_silence, std_path)
 
-        # 2. Транскрипція → субтитри
+        # 2. Транскрипція (один виклик Whisper/AAI — рендеримо в кілька
+        #    стилів субтитрів нижче без повторних запитів до платного API)
         await msg.edit_text("📝 Транскрибую відео...")
-        srt_path, transcript = await asyncio.to_thread(transcribe_to_srt, no_silence_path)
+        word_tuples, segments, transcript = await asyncio.to_thread(transcribe_words, no_silence_path)
 
         # 3. Нормалізація до 9:16
         await msg.edit_text("📐 Приводжу відео до 9:16...")
         vertical_path = normalize_vertical(no_silence_path)
 
-        # 4. Burn-in субтитрів
+        # 4. Burn-in субтитрів — ОКРЕМЕ відео на TikTok і на Instagram (інший
+        #    колір/розмір/позиція тексту), щоб платформи не розпізнали їх як
+        #    дублікат одна одної і не порізали охоплення за crossposting-
+        #    детекцією. Одна транскрипція → 2 рендери (build_ass_for_style),
+        #    без повторного виклику Whisper.
         if transcript and transcript.strip():
-            await msg.edit_text("🎬 Накладаю субтитри...")
-            final_video_path = burn_subtitles(vertical_path, srt_path)
+            for platform in ("tiktok", "instagram"):
+                await msg.edit_text(f"🎬 Накладаю субтитри ({platform})...")
+                ass_content = build_ass_for_style(word_tuples, segments, platform)
+                ass_path = save_ass(ass_content)
+                ass_paths.append(ass_path)
+                final_video_paths[platform] = await asyncio.to_thread(burn_subtitles, vertical_path, ass_path)
         else:
             await msg.edit_text("🎬 Мовлення не розпізнано — субтитри пропускаю...")
-            final_video_path = vertical_path
+            final_video_paths["tiktok"] = vertical_path
+            final_video_paths["instagram"] = vertical_path
 
-        # 5. Обкладинка
+        # 5. Обкладинка (кадр однаковий незалежно від стилю субтитрів)
         await msg.edit_text("🖼 Генерую обкладинку...")
-        frame_path = extract_frame(final_video_path, timestamp=1.5)
+        frame_path = extract_frame(final_video_paths["tiktok"], timestamp=1.5)
         cover_path = generate_cover(transcript, frame_path)
 
-        # 6. Завантаження на S3
+        # 6. Завантаження на S3 (2 відео + обкладинка)
         await msg.edit_text("☁️ Завантажую на S3...")
-        s3_video_url = upload_file(final_video_path, prefix="videos")
+        s3_video_url = upload_file(final_video_paths["tiktok"], prefix="videos")
+        s3_video_url_instagram = (
+            upload_file(final_video_paths["instagram"], prefix="videos")
+            if final_video_paths["instagram"] != final_video_paths["tiktok"]
+            else s3_video_url
+        )
         s3_cover_url = upload_file(cover_path, prefix="covers")
 
         # 7. Зберігаємо в БД
         video_id = db.create_video(
             original_filename=original_name,
             s3_url=s3_video_url,
+            s3_url_instagram=s3_video_url_instagram,
             cover_s3_url=s3_cover_url,
             transcript=transcript,
         )
@@ -831,7 +851,8 @@ async def _process_video_file(
         logger.error(f"Pipeline error: {e}", exc_info=True)
         await msg.edit_text(f"❌ Помилка обробки: {e}")
     finally:
-        for path in [local_path, no_silence_path, vertical_path, srt_path, final_video_path, frame_path, cover_path]:
+        cleanup_paths = [local_path, no_silence_path, vertical_path, *ass_paths, *final_video_paths.values(), frame_path, cover_path]
+        for path in cleanup_paths:
             if not path:
                 continue
             try:
@@ -982,8 +1003,10 @@ async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename:
     Запускає пайплайн обробки для файлу з Drive без реального telegram.Update.
     Надсилає результати напряму в chat_id.
     """
-    std_path = no_silence_path = vertical_path = srt_path = None
-    final_video_path = frame_path = cover_path = None
+    std_path = no_silence_path = vertical_path = None
+    ass_paths = []
+    final_video_paths = {}
+    frame_path = cover_path = None
 
     try:
         await msg.edit_text(f"🔄 «{filename}» — конвертую формат...")
@@ -993,28 +1016,41 @@ async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename:
         no_silence_path = await asyncio.to_thread(remove_silence, std_path)
 
         await msg.edit_text(f"📝 «{filename}» — транскрибую...")
-        srt_path, transcript = await asyncio.to_thread(transcribe_to_srt, no_silence_path)
+        word_tuples, segments, transcript = await asyncio.to_thread(transcribe_words, no_silence_path)
 
         await msg.edit_text(f"📐 «{filename}» — приводжу до 9:16...")
         vertical_path = await asyncio.to_thread(normalize_vertical, no_silence_path)
 
+        # Окреме відео на TikTok і на Instagram (інший стиль субтитрів) —
+        # див. коментар у _process_video_file вище.
         if transcript and transcript.strip():
-            await msg.edit_text(f"🎬 «{filename}» — накладаю субтитри...")
-            final_video_path = await asyncio.to_thread(burn_subtitles, vertical_path, srt_path)
+            for platform in ("tiktok", "instagram"):
+                await msg.edit_text(f"🎬 «{filename}» — накладаю субтитри ({platform})...")
+                ass_content = build_ass_for_style(word_tuples, segments, platform)
+                ass_path = await asyncio.to_thread(save_ass, ass_content)
+                ass_paths.append(ass_path)
+                final_video_paths[platform] = await asyncio.to_thread(burn_subtitles, vertical_path, ass_path)
         else:
-            final_video_path = vertical_path
+            final_video_paths["tiktok"] = vertical_path
+            final_video_paths["instagram"] = vertical_path
 
         await msg.edit_text(f"🖼 «{filename}» — генерую обкладинку...")
-        frame_path = await asyncio.to_thread(extract_frame, final_video_path, 1.5)
+        frame_path = await asyncio.to_thread(extract_frame, final_video_paths["tiktok"], 1.5)
         cover_path = await asyncio.to_thread(generate_cover, transcript, frame_path)
 
         await msg.edit_text(f"☁️ «{filename}» — завантажую на S3...")
-        s3_video_url = await asyncio.to_thread(upload_file, final_video_path, "videos")
+        s3_video_url = await asyncio.to_thread(upload_file, final_video_paths["tiktok"], "videos")
+        s3_video_url_instagram = (
+            await asyncio.to_thread(upload_file, final_video_paths["instagram"], "videos")
+            if final_video_paths["instagram"] != final_video_paths["tiktok"]
+            else s3_video_url
+        )
         s3_cover_url = await asyncio.to_thread(upload_file, cover_path, "covers")
 
         video_id = db.create_video(
             original_filename=filename,
             s3_url=s3_video_url,
+            s3_url_instagram=s3_video_url_instagram,
             cover_s3_url=s3_cover_url,
             transcript=transcript,
         )
@@ -1055,7 +1091,8 @@ async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename:
         await msg.edit_text(f"❌ Помилка обробки «{filename}»: {e}")
     finally:
         unmark_processing(file_id)
-        for path in [local_path, std_path, no_silence_path, vertical_path, srt_path, final_video_path, frame_path, cover_path]:
+        cleanup_paths = [local_path, std_path, no_silence_path, vertical_path, *ass_paths, *final_video_paths.values(), frame_path, cover_path]
+        for path in cleanup_paths:
             if not path:
                 continue
             try:

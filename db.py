@@ -111,6 +111,11 @@ def _migrate(conn):
     # instagram_carousel підтримка в черзі публікацій
     add_column_if_missing("publish_queue", "carousel_id", "carousel_id INTEGER")
 
+    # Окреме відео (інший стиль субтитрів) для Instagram — щоб платформи не
+    # розпізнавали TikTok- і Instagram-версію як дублікат одна одної і не
+    # різали охоплення. s3_url лишається TikTok-варіантом (як і раніше).
+    add_column_if_missing("videos", "s3_url_instagram", "s3_url_instagram TEXT")
+
     # publish_queue.video_id був NOT NULL у старій схемі — записи для
     # instagram_carousel мають video_id=NULL (замість цього carousel_id).
     # SQLite не підтримує ALTER COLUMN DROP NOT NULL, тож на старій БД
@@ -194,11 +199,23 @@ def get_instagram_tokens() -> Optional[dict]:
 
 # ── Videos ────────────────────────────────────────────────────────────────────
 
-def create_video(original_filename: str, s3_url: str, cover_s3_url: str, transcript: str) -> int:
+def create_video(
+    original_filename: str,
+    s3_url: str,
+    cover_s3_url: str,
+    transcript: str,
+    s3_url_instagram: str = None,
+) -> int:
+    """s3_url — відео зі стилем субтитрів "tiktok" (як і раніше).
+    s3_url_instagram — те саме відео, але з іншим стилем субтитрів
+    (колір/розмір/позиція), щоб Instagram не розпізнав його як дублікат
+    TikTok-версії. Якщо не передано (напр. немає мовлення для субтитрів) —
+    NULL, і publish-код сам падає назад на s3_url."""
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO videos (original_filename, s3_url, cover_s3_url, transcript) VALUES (?,?,?,?)",
-            (original_filename, s3_url, cover_s3_url, transcript),
+            "INSERT INTO videos (original_filename, s3_url, cover_s3_url, transcript, s3_url_instagram) "
+            "VALUES (?,?,?,?,?)",
+            (original_filename, s3_url, cover_s3_url, transcript, s3_url_instagram),
         )
         return cur.lastrowid
 
@@ -334,7 +351,7 @@ def get_pending_queue():
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT q.*,
-                   v.s3_url, v.cover_s3_url, v.transcript, v.tiktok_caption,
+                   v.s3_url, v.s3_url_instagram, v.cover_s3_url, v.transcript, v.tiktok_caption,
                    c.image_urls AS carousel_image_urls, c.caption AS carousel_caption
             FROM publish_queue q
             LEFT JOIN videos v ON v.id = q.video_id

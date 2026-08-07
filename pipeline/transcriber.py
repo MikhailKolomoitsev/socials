@@ -1,6 +1,17 @@
 """
-Транскрипція аудіо → .srt субтитри.
+Транскрипція аудіо → .ass субтитри, у кількох стилях (по одному на платформу).
 Підтримує OpenAI Whisper API та AssemblyAI (вибирається через config).
+
+Навіщо кілька стилів: TikTok і Instagram (і, ймовірно, YouTube Shorts у
+майбутньому) детектять контент, що вже опубліковано десь-інде
+("crossposting"/дублікат), і штучно ріжуть охоплення такому відео. Тому для
+кожної платформи рендеримо ОКРЕМЕ фінальне відео — той самий кліп, але з
+трохи іншим кольором/розміром/позицією субтитрів, тобто помітно різними
+пікселями саме там, де платформа найімовірніше рахує perceptual hash.
+
+Транскрипцію (виклик Whisper/AssemblyAI) робимо ОДИН раз (transcribe_words),
+а сам ASS для кожного стилю рендеримо окремо (build_ass_for_style) — без
+повторних викликів платного API.
 """
 
 import os
@@ -10,25 +21,79 @@ from config import TMP_DIR, OPENAI_API_KEY, ASSEMBLYAI_API_KEY
 from pipeline.ffmpeg_processor import extract_audio
 
 
-def transcribe_to_srt(video_path: str) -> tuple[str, str]:
-    """
-    Транскрибує відео і повертає (srt_path, plain_text).
+# ── Стилі субтитрів під платформу ────────────────────────────────────────────
+#
+# Щоб додати ще одну платформу (напр. "youtube_shorts") — достатньо додати
+# новий ключ сюди з власним набором параметрів. main.py і queue_runner.py
+# більше нічого міняти не треба: main.py рендерить/вивантажує по одному
+# відео на кожен ключ SUBTITLE_STYLES, і зберігає URL у db.videos у
+# колонку s3_url_<platform> (крім "tiktok" — той лишається в s3_url для
+# зворотної сумісності зі старими рядками БД).
+SUBTITLE_STYLES = {
+    "tiktok": {
+        "font_name": "Montserrat ExtraBold",
+        "font_size": 52,
+        "margin_v": 500,
+        "outline": 3,
+        "shadow": 2,
+        "highlight_color": "&H00D7FF&",   # золотисто-жовтий (ASS BGR)
+        "default_color": "&H00FFFFFF&",   # білий, alpha=00 (непрозорий)
+    },
+    "instagram": {
+        "font_name": "Montserrat ExtraBold",
+        "font_size": 54,
+        "margin_v": 560,                  # трохи вище за TikTok
+        "outline": 3,
+        "shadow": 2,
+        "highlight_color": "&H6C30E1&",   # рожево-фіолетовий (Instagram-акцент), ASS BGR
+        "default_color": "&H00FFFFFF&",
+    },
+}
 
-    Returns:
-        srt_path: шлях до .srt файлу
-        transcript: plain text транскрипція
+
+def transcribe_words(video_path: str) -> tuple[list, list, str]:
+    """
+    Транскрибує відео і повертає (word_tuples, segments, plain_text) — БЕЗ
+    побудови ASS, щоб той самий результат транскрипції можна було
+    відрендерити в кілька стилів через build_ass_for_style(), не викликаючи
+    Whisper/AssemblyAI повторно (платний API).
+
+    word_tuples: список (word, start, end); порожній список, якщо API не
+                 повернув word-level таймстемпи.
+    segments: сирі сегменти (fallback для build_ass_for_style, якщо
+              word_tuples порожній).
     """
     if OPENAI_API_KEY:
-        return _transcribe_whisper(video_path)
+        return _transcribe_whisper_words(video_path)
     elif ASSEMBLYAI_API_KEY:
-        return _transcribe_assemblyai(video_path)
+        return _transcribe_assemblyai_words(video_path)
     else:
         raise ValueError("Не задано OPENAI_API_KEY або ASSEMBLYAI_API_KEY у .env")
 
 
+def build_ass_for_style(word_tuples: list, segments: list, style_name: str) -> str:
+    """Рендерить ASS-субтитри з уже готової транскрипції у стилі style_name
+    (див. SUBTITLE_STYLES). Не звертається до жодного зовнішнього API."""
+    style = SUBTITLE_STYLES[style_name]
+    words = [w for w in word_tuples if w[0]]
+    if words:
+        return _word_tuples_to_ass(words, style)
+    return _segments_to_ass(segments, style)
+
+
+def transcribe_to_srt(video_path: str, style_name: str = "tiktok") -> tuple[str, str]:
+    """Зворотна сумісність: один виклик = транскрипція + ASS ОДНИМ стилем.
+    Використовуй transcribe_words() + build_ass_for_style() там, де потрібно
+    кілька стилів з однієї транскрипції (так робить main.py)."""
+    word_tuples, segments, plain_text = transcribe_words(video_path)
+    ass_content = build_ass_for_style(word_tuples, segments, style_name)
+    srt_path = save_ass(ass_content)
+    return srt_path, plain_text
+
+
 # ── OpenAI Whisper ─────────────────────────────────────────────────────────────
 
-def _transcribe_whisper(video_path: str) -> tuple[str, str]:
+def _transcribe_whisper_words(video_path: str) -> tuple[list, list, str]:
     import logging
     logger = logging.getLogger(__name__)
     from openai import OpenAI
@@ -69,37 +134,28 @@ def _transcribe_whisper(video_path: str) -> tuple[str, str]:
 
     plain_text = response.text or ""
     words = getattr(response, "words", None) or []
+    segments = getattr(response, "segments", None) or []
 
-    if words:
-        # Word-level → короткі "панчові" субтитри (3-4 слова на кадр),
-        # синхронні з мовленням — TikTok-стиль, а не цілі речення одразу.
-        #
-        # ВАЖЛИВО: модель Transcription у openai==1.35.0 описує тільше поле
-        # "text" — words/segments приходять як "extra"-поля (model_config
-        # extra="allow") і потрапляють сюди як звичайні dict, А НЕ як
-        # pydantic-об'єкти. getattr(dict, "word", default) завжди повертає
-        # default, бо в dict немає атрибутів — тільки ключі. Тому читаємо
-        # через _field(), який працює і з dict, і з об'єктом.
-        word_tuples = [
-            (
-                (_field(w, "word", "") or "").strip(),
-                _field(w, "start", 0) or 0,
-                _field(w, "end", 0) or 0,
-            )
-            for w in words
-        ]
-        srt_content = _word_tuples_to_ass(word_tuples)
-    else:
-        # Fallback на segment-level, якщо API раптом не повернув слова.
-        srt_content = _segments_to_ass(getattr(response, "segments", None) or [])
-
-    srt_path = _save_srt(srt_content)
-    return srt_path, plain_text
+    # ВАЖЛИВО: модель Transcription у openai==1.35.0 описує тільки поле
+    # "text" — words/segments приходять як "extra"-поля (model_config
+    # extra="allow") і потрапляють сюди як звичайні dict, А НЕ як
+    # pydantic-об'єкти. getattr(dict, "word", default) завжди повертає
+    # default, бо в dict немає атрибутів — тільки ключі. Тому читаємо
+    # через _field(), який працює і з dict, і з об'єктом.
+    word_tuples = [
+        (
+            (_field(w, "word", "") or "").strip(),
+            _field(w, "start", 0) or 0,
+            _field(w, "end", 0) or 0,
+        )
+        for w in words
+    ]
+    return word_tuples, segments, plain_text
 
 
 # ── AssemblyAI ─────────────────────────────────────────────────────────────────
 
-def _transcribe_assemblyai(video_path: str) -> tuple[str, str]:
+def _transcribe_assemblyai_words(video_path: str) -> tuple[list, list, str]:
     import assemblyai as aai
 
     aai.settings.api_key = ASSEMBLYAI_API_KEY
@@ -110,23 +166,14 @@ def _transcribe_assemblyai(video_path: str) -> tuple[str, str]:
     if transcript.status == aai.TranscriptStatus.error:
         raise RuntimeError(f"AssemblyAI error: {transcript.error}")
 
-    # Конвертуємо utterances в SRT
-    srt_content = _assemblyai_to_srt(transcript)
-    plain_text = transcript.text or ""
-
-    srt_path = _save_srt(srt_content)
-    return srt_path, plain_text
-
-
-def _assemblyai_to_srt(transcript) -> str:
     words = transcript.words or []
     word_tuples = [(w.text, w.start / 1000, w.end / 1000) for w in words]
-    return _word_tuples_to_ass(word_tuples)
+    return word_tuples, [], (transcript.text or "")
 
 
 # ── Утиліти ───────────────────────────────────────────────────────────────────
 
-def _segments_to_ass(segments: list) -> str:
+def _segments_to_ass(segments: list, style: dict) -> str:
     """Fallback: сегменти → ASS (коли word-level недоступний)."""
     chunks = []
     for seg in segments:
@@ -134,8 +181,8 @@ def _segments_to_ass(segments: list) -> str:
         end = _field(seg, "end", 0) or 0
         text = (_field(seg, "text", "") or "").strip()
         if text:
-            chunks.append((_render_chunk_text(text.split()), start, end))
-    return _chunks_to_ass(chunks)
+            chunks.append((_render_chunk_text(text.split(), style), start, end))
+    return _chunks_to_ass(chunks, style)
 
 
 def _field(obj, key: str, default=None):
@@ -154,21 +201,20 @@ def _seconds_to_ass_time(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def _word_tuples_to_ass(word_tuples: list) -> str:
+def _word_tuples_to_ass(words: list, style: dict) -> str:
     """
     Групує слова в чанки ЗМІННОГО розміру (1-3 слова) — динамічний ритм.
     ASS (замість SRT) дає повний контроль над шрифтом, розміром і позицією —
     subtitles filter в ffmpeg застосовує force_style непередбачувано для SRT.
     """
-    words = [w for w in word_tuples if w[0]]
     if not words:
         return ""
     chunks_raw = _dynamic_chunks(words)
     chunks = [
-        (_render_chunk_text([w[0] for w in ch]), ch[0][1], ch[-1][2])
+        (_render_chunk_text([w[0] for w in ch], style), ch[0][1], ch[-1][2])
         for ch in chunks_raw
     ]
-    return _chunks_to_ass(chunks)
+    return _chunks_to_ass(chunks, style)
 
 
 def _dynamic_chunks(words: list, solo_probability: float = 0.4) -> list:
@@ -197,15 +243,6 @@ def _dynamic_chunks(words: list, solo_probability: float = 0.4) -> list:
         i += size
     return chunks
 
-
-# Параметри стилю субтитрів (TikTok-стиль)
-_ASS_FONT_NAME  = "Montserrat ExtraBold"
-_ASS_FONT_SIZE  = 52   # px у PlayRes-координатах (1080×1920) — було 38 (×1.37)
-_ASS_MARGIN_V   = 500  # px від нижнього краю (Alignment=2 → відступ знизу) — було 550, опущено ще нижче
-_ASS_OUTLINE    = 3
-_ASS_SHADOW     = 2
-_ASS_HIGHLIGHT_COLOR = "&H00D7FF&"   # золотисто-жовтий (ASS BGR) для ключових слів
-_ASS_DEFAULT_COLOR   = "&H00FFFFFF&"  # білий (з альфа-байтом 00 = непрозорий), повертаємось до нього після виділеного слова
 
 # Короткі українські службові слова, які не виділяємо кольором (не несуть змістового навантаження)
 _UK_STOPWORDS = {
@@ -240,10 +277,11 @@ def _pick_highlight_word(words: list) -> str | None:
     return max(candidates, key=lambda w: len(_strip_punct(w)))
 
 
-def _render_chunk_text(words: list) -> str:
+def _render_chunk_text(words: list, style: dict) -> str:
     """
     Формує ASS-текст чанка: ключове слово обгортається кольоровим тегом
     {\\c...}, решта лишається білою (успадковує PrimaryColour зі стилю).
+    Колір виділення береться зі style — різний для кожної платформи.
     """
     if not words:
         return ""
@@ -255,18 +293,19 @@ def _render_chunk_text(words: list) -> str:
     used = False
     for w in words:
         if not used and w == highlight:
-            parts.append(f"{{\\c{_ASS_HIGHLIGHT_COLOR}}}{w}{{\\c{_ASS_DEFAULT_COLOR}}}")
+            parts.append(f"{{\\c{style['highlight_color']}}}{w}{{\\c{style['default_color']}}}")
             used = True
         else:
             parts.append(w)
     return " ".join(parts)
 
 
-def _chunks_to_ass(chunks: list) -> str:
+def _chunks_to_ass(chunks: list, style: dict) -> str:
     """
     chunks: список (text, start_sec, end_sec)
     Повертає повний ASS-файл з заголовком і подіями.
     PlayResX/Y задаємо 1080×1920 — відповідає нормалізованому відео.
+    Fontsize/MarginV беруться зі style — різні для кожної платформи.
     """
     header = (
         "[Script Info]\n"
@@ -279,10 +318,10 @@ def _chunks_to_ass(chunks: list) -> str:
         "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{_ASS_FONT_NAME},{_ASS_FONT_SIZE},"
+        f"Style: Default,{style['font_name']},{style['font_size']},"
         f"&H00FFFFFF,&H00000000,&H80000000,"  # білий текст, чорна обводка, напівпрозорий shadow
-        f"-1,0,0,0,100,100,0,0,1,{_ASS_OUTLINE},{_ASS_SHADOW},"
-        f"2,20,20,{_ASS_MARGIN_V},1\n"       # Alignment=2 (знизу по центру)
+        f"-1,0,0,0,100,100,0,0,1,{style['outline']},{style['shadow']},"
+        f"2,20,20,{style['margin_v']},1\n"       # Alignment=2 (знизу по центру)
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -295,8 +334,8 @@ def _chunks_to_ass(chunks: list) -> str:
     return header + "\n".join(events) + "\n"
 
 
-def _save_srt(content: str) -> str:
-    """Зберігає ASS-файл (назва збережена для сумісності з рештою коду)."""
+def save_ass(content: str) -> str:
+    """Зберігає ASS-файл у TMP_DIR і повертає шлях до нього."""
     path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}.ass")
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)

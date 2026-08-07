@@ -64,8 +64,13 @@ def _publish_tiktok(item: dict):
 
 def _publish_instagram(item: dict):
     caption = _generate_instagram_caption(item.get("transcript", ""))
+    # s3_url_instagram — версія з іншим стилем субтитрів (не такою, як у
+    # TikTok), щоб Instagram не порахував це дублікатом TikTok-публікації і
+    # не порізав охоплення. Fallback на s3_url — для рядків, збережених до
+    # цієї зміни (де окремого Instagram-варіанту ще не було).
+    video_url = item.get("s3_url_instagram") or item["s3_url"]
     media_id = publish_reel(
-        video_url=item["s3_url"],
+        video_url=video_url,
         caption=caption,
         cover_url=item.get("cover_s3_url"),
     )

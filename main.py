@@ -790,7 +790,6 @@ async def _process_video_file(
             cover_s3_url=s3_cover_url,
             transcript=transcript,
         )
-        context.user_data["pending_video_id"] = video_id
 
         # 8. Надсилаємо обкладинку + підпис окремим повідомленням (code-блок = кнопка Copy)
         if transcript and transcript.strip():
@@ -816,7 +815,7 @@ async def _process_video_file(
                 )
 
         # 9. Питаємо коли публікувати
-        keyboard = _build_schedule_keyboard()
+        keyboard = _build_schedule_keyboard(video_id)
         transcript_line = (
             f"📝 Транскрипція: <i>{html.escape(transcript[:100])}...</i>\n\n"
             if transcript and transcript.strip()
@@ -841,8 +840,15 @@ async def _process_video_file(
                 pass
 
 
-def _build_schedule_keyboard() -> InlineKeyboardMarkup:
-    """Кнопки з запланованими часами публікації."""
+def _build_schedule_keyboard(video_id: int) -> InlineKeyboardMarkup:
+    """Кнопки з запланованими часами публікації.
+
+    video_id вшитий прямо в callback_data (як і для Drive-флоу нижче), а НЕ
+    зберігається в context.user_data — бо user_data це один спільний слот на
+    юзера: якщо обробляється кілька відео паралельно (два надіслані поспіль),
+    останнє оброблене перезаписувало б слот, і кнопки під СТАРІШИМ
+    повідомленням почали б планувати НОВІШЕ відео. Вшивання id прибирає цю
+    залежність від порядку обробки."""
     buttons = []
     now = datetime.now()
 
@@ -853,12 +859,12 @@ def _build_schedule_keyboard() -> InlineKeyboardMarkup:
             scheduled += timedelta(days=1)
 
         label = f"🕐 {time_str}"
-        callback_data = f"schedule_tiktok:{scheduled.isoformat()}"
+        callback_data = f"schedule_tiktok:{video_id}:{scheduled.isoformat()}"
         buttons.append([InlineKeyboardButton(label, callback_data=callback_data)])
 
-    buttons.append([InlineKeyboardButton("🔴 Зараз", callback_data="schedule_tiktok:now")])
+    buttons.append([InlineKeyboardButton("🔴 Зараз", callback_data=f"schedule_tiktok:{video_id}:now")])
     buttons.append([InlineKeyboardButton(
-        "🚀 TikTok + Instagram зараз", callback_data="schedule_both:now",
+        "🚀 TikTok + Instagram зараз", callback_data=f"schedule_both:{video_id}",
     )])
     return InlineKeyboardMarkup(buttons)
 
@@ -876,15 +882,12 @@ async def handle_schedule_both_callback(update: Update, context: ContextTypes.DE
     if not is_allowed(update):
         return
 
-    video_id = context.user_data.get("pending_video_id")
-    if not video_id:
-        await query.edit_message_text("❌ Не знайдено відео. Надішли його знову.")
-        return
+    _, video_id_str = query.data.split(":", 1)
+    video_id = int(video_id_str)
 
     scheduled_at = datetime.now()
     db.enqueue(video_id, "tiktok", scheduled_at)
     db.enqueue(video_id, "instagram", scheduled_at)
-    context.user_data.pop("pending_video_id", None)
 
     await query.edit_message_text(
         "✅ Поставлено в чергу зараз на ОБИДВІ платформи:\n"
@@ -900,13 +903,9 @@ async def handle_schedule_callback(update: Update, context: ContextTypes.DEFAULT
     if not is_allowed(update):
         return
 
-    data = query.data  # "schedule_tiktok:2026-06-11T09:00:00" або "schedule_tiktok:now"
-    _, time_part = data.split(":", 1)
-
-    video_id = context.user_data.get("pending_video_id")
-    if not video_id:
-        await query.edit_message_text("❌ Не знайдено відео. Надішли його знову.")
-        return
+    data = query.data  # "schedule_tiktok:<video_id>:2026-06-11T09:00:00" або "...:now"
+    _, video_id_str, time_part = data.split(":", 2)
+    video_id = int(video_id_str)
 
     if time_part == "now":
         scheduled_at = datetime.now()
@@ -916,7 +915,6 @@ async def handle_schedule_callback(update: Update, context: ContextTypes.DEFAULT
         label = scheduled_at.strftime("%H:%M")
 
     db.enqueue(video_id, "tiktok", scheduled_at)
-    context.user_data.pop("pending_video_id", None)
 
     await query.edit_message_text(
         f"✅ Поставлено в чергу на TikTok о {label}.\n"

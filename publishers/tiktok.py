@@ -162,6 +162,48 @@ def get_video_views(video_id: str) -> int:
     return videos[0].get("view_count", 0)
 
 
+def list_recent_public_videos(max_count: int = 20) -> list:
+    """
+    Читає список ПУБЛІЧНИХ відео акаунта (вже опубліковані власником вручну
+    з чернеток) разом з реальними переглядами — через Display API
+    (POST /v2/video/list/, потрібен scope video.list).
+
+    На відміну від get_video_views() (Research API, вимагає знати video_id
+    заздалегідь), цей ендпоінт сам віддає список останніх відео акаунта —
+    саме те, що треба, щоб дізнатись "що вже опубліковано і скільки набрало".
+
+    Returns:
+        Список словників, найновіші перші:
+        [{"id", "create_time" (datetime), "view_count", "like_count",
+          "share_count", "cover_image_url", "share_url"}, ...]
+    """
+    headers = {
+        "Authorization": f"Bearer {get_valid_access_token()}",
+        "Content-Type": "application/json",
+    }
+
+    resp = requests.post(
+        f"{BASE_URL}/video/list/",
+        headers=headers,
+        params={
+            "fields": "id,create_time,cover_image_url,share_url,view_count,like_count,comment_count,share_count"
+        },
+        json={"max_count": min(max_count, 20)},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"TikTok video.list HTTP {resp.status_code}: {resp.text}")
+    data = resp.json()
+
+    if data.get("error", {}).get("code") not in ("ok", None):
+        raise RuntimeError(f"TikTok video.list error: {data}")
+
+    videos = data.get("data", {}).get("videos", [])
+    for v in videos:
+        v["create_time"] = datetime.fromtimestamp(v["create_time"])
+    return videos
+
+
 def _wait_for_publish(publish_id: str, headers: dict, max_retries: int = 10) -> str:
     """
     Чекає поки TikTok обробить відео і завантажить його у "чернетки".

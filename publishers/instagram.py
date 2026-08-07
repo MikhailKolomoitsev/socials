@@ -100,6 +100,75 @@ def publish_reel(video_url: str, caption: str, cover_url: str = None) -> str:
     return _publish_container(ig_user_id, access_token, container_id)
 
 
+def publish_carousel(image_urls: list, caption: str) -> str:
+    """
+    Публікує карусель (сторітейл) в Instagram: N окремих IMAGE-контейнерів
+    ("carousel items"), потім один CAROUSEL-контейнер, що їх обʼєднує.
+
+    Документація: https://developers.facebook.com/docs/instagram-platform/content-publishing#carousel-posts
+
+    Args:
+        image_urls: публічні URL слайдів (S3), у порядку показу. 2-10 штук.
+        caption: підпис під каруселлю
+
+    Returns:
+        Instagram media ID
+    """
+    if not (2 <= len(image_urls) <= 10):
+        raise ValueError(f"Instagram карусель приймає 2-10 зображень, отримано {len(image_urls)}")
+
+    access_token, ig_user_id = _get_valid_token_and_user_id()
+
+    child_ids = []
+    for url in image_urls:
+        child_id = _create_carousel_item(ig_user_id, access_token, url)
+        child_ids.append(child_id)
+
+    for child_id in child_ids:
+        _wait_for_container(child_id, access_token)
+
+    container_id = _create_carousel_container(ig_user_id, access_token, child_ids, caption)
+    _wait_for_container(container_id, access_token)
+    return _publish_container(ig_user_id, access_token, container_id)
+
+
+def _create_carousel_item(ig_user_id, access_token: str, image_url: str) -> str:
+    """Крок 1 (на кожен слайд): окремий IMAGE-контейнер з is_carousel_item=true."""
+    resp = requests.post(
+        f"{GRAPH_URL}/{ig_user_id}/media",
+        params={
+            "image_url": image_url,
+            "is_carousel_item": "true",
+            "access_token": access_token,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "id" not in data:
+        raise RuntimeError(f"Instagram carousel item error: {data}")
+    return data["id"]
+
+
+def _create_carousel_container(ig_user_id, access_token: str, child_ids: list, caption: str) -> str:
+    """Крок 2: батьківський CAROUSEL-контейнер, що обʼєднує всі слайди."""
+    resp = requests.post(
+        f"{GRAPH_URL}/{ig_user_id}/media",
+        params={
+            "media_type": "CAROUSEL",
+            "children": ",".join(child_ids),
+            "caption": caption,
+            "access_token": access_token,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "id" not in data:
+        raise RuntimeError(f"Instagram carousel container error: {data}")
+    return data["id"]
+
+
 def _create_container(ig_user_id, access_token: str, video_url: str, caption: str, cover_url: str = None) -> str:
     """Крок 1: Створюємо media container."""
     params = {

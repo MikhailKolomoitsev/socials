@@ -172,8 +172,8 @@ def _word_tuples_to_ass(word_tuples: list, chunk_size: int = 3) -> str:
 
 # Параметри стилю субтитрів (TikTok-стиль)
 _ASS_FONT_NAME  = "Montserrat ExtraBold"
-_ASS_FONT_SIZE  = 30   # px у PlayRes-координатах (1080×1920) — було 40, замалий екран робив текст завеликим
-_ASS_MARGIN_V   = 650  # px від нижнього краю (Alignment=2 → відступ знизу) — нижче середини (PlayResY=1920), але з запасом від нижньої панелі TikTok/Reels
+_ASS_FONT_SIZE  = 32   # px у PlayRes-координатах (1080×1920) — було 30
+_ASS_MARGIN_V   = 550  # px від нижнього краю (Alignment=2 → відступ знизу) — було 650, опущено на 100
 _ASS_OUTLINE    = 3
 _ASS_SHADOW     = 2
 _ASS_HIGHLIGHT_COLOR = "&H00D7FF&"   # золотисто-жовтий (ASS BGR) для ключових слів

@@ -40,6 +40,16 @@ def init_db():
                 best_of_day INTEGER DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS carousels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                image_urls TEXT NOT NULL,      -- JSON-масив публічних S3 URL, у порядку слайдів
+                caption TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+
+                instagram_media_id TEXT,
+                instagram_published_at TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS tiktok_tokens (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 open_id TEXT NOT NULL,
@@ -59,12 +69,14 @@ def init_db():
 
             CREATE TABLE IF NOT EXISTS publish_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                video_id INTEGER NOT NULL,
-                platform TEXT NOT NULL,        -- 'tiktok' або 'instagram'
+                video_id INTEGER,              -- NULL для платформи 'instagram_carousel'
+                carousel_id INTEGER,           -- NULL для 'tiktok' / 'instagram'
+                platform TEXT NOT NULL,        -- 'tiktok' / 'instagram' / 'instagram_carousel'
                 scheduled_at TEXT NOT NULL,    -- ISO datetime
                 status TEXT DEFAULT 'pending', -- pending / done / failed
                 created_at TEXT DEFAULT (datetime('now')),
-                FOREIGN KEY (video_id) REFERENCES videos(id)
+                FOREIGN KEY (video_id) REFERENCES videos(id),
+                FOREIGN KEY (carousel_id) REFERENCES carousels(id)
             );
 
             CREATE TABLE IF NOT EXISTS instagram_dm_log (
@@ -74,6 +86,54 @@ def init_db():
                 error TEXT,
                 sent_at TEXT DEFAULT (datetime('now'))
             );
+        """)
+        _migrate(conn)
+
+
+def _migrate(conn):
+    """
+    Guarded ALTER TABLE для колонок, доданих ПІСЛЯ першого деплою.
+    CREATE TABLE IF NOT EXISTS вище не чіпає вже існуючі таблиці — тому нові
+    колонки на старих БД (Railway volume, що переживає редеплої) додаємо тут,
+    перевіряючи PRAGMA table_info, щоб не впасти на "duplicate column".
+    """
+    def add_column_if_missing(table: str, column: str, ddl: str):
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+    # Реальні перегляди TikTok, зіставлені з опублікованим вручну відео
+    # (див. publishers/tiktok.py:list_recent_public_videos + main.py:cmd_publish_ig)
+    add_column_if_missing("videos", "tiktok_public_video_id", "tiktok_public_video_id TEXT")
+    add_column_if_missing("videos", "tiktok_public_views", "tiktok_public_views INTEGER")
+    add_column_if_missing("videos", "tiktok_public_share_url", "tiktok_public_share_url TEXT")
+
+    # instagram_carousel підтримка в черзі публікацій
+    add_column_if_missing("publish_queue", "carousel_id", "carousel_id INTEGER")
+
+    # publish_queue.video_id був NOT NULL у старій схемі — записи для
+    # instagram_carousel мають video_id=NULL (замість цього carousel_id).
+    # SQLite не підтримує ALTER COLUMN DROP NOT NULL, тож на старій БД
+    # (Railway volume, що переживає редеплої) перебудовуємо таблицю один раз.
+    pq_info = list(conn.execute("PRAGMA table_info(publish_queue)"))
+    video_id_col = next((r for r in pq_info if r[1] == "video_id"), None)
+    if video_id_col and video_id_col[3] == 1:  # notnull-прапорець
+        conn.executescript("""
+            CREATE TABLE publish_queue_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video_id INTEGER,
+                carousel_id INTEGER,
+                platform TEXT NOT NULL,
+                scheduled_at TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (video_id) REFERENCES videos(id),
+                FOREIGN KEY (carousel_id) REFERENCES carousels(id)
+            );
+            INSERT INTO publish_queue_new (id, video_id, carousel_id, platform, scheduled_at, status, created_at)
+                SELECT id, video_id, carousel_id, platform, scheduled_at, status, created_at FROM publish_queue;
+            DROP TABLE publish_queue;
+            ALTER TABLE publish_queue_new RENAME TO publish_queue;
         """)
 
 
@@ -201,16 +261,34 @@ def get_recent_tiktoks_for_instagram(limit: int = 10):
 
     Використовується Telegram-командою "опублікувати в Instagram": власник сам
     дивиться, яке відео "вибухнуло" в TikTok, і вибирає його зі списку тут.
+
+    Сортування: відео з відомими реальними переглядами (зіставленими через
+    match_tiktok_public_video, див. main.py:cmd_publish_ig) — першими, від
+    найбільшої кількості переглядів; відео без зіставлення (ще в чернетках
+    або ще не знайдено серед публічних) — після, за часом.
     """
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT * FROM videos
             WHERE tiktok_video_id IS NOT NULL
               AND instagram_media_id IS NULL
-            ORDER BY tiktok_published_at DESC
+            ORDER BY (tiktok_public_views IS NULL) ASC, tiktok_public_views DESC, tiktok_published_at DESC
             LIMIT ?
         """, (limit,)).fetchall()
     return [dict(r) for r in rows]
+
+
+def match_tiktok_public_video(video_id: int, public_video_id: str, views: int, share_url: str):
+    """Зберігає результат зіставлення чернетки з публічним TikTok-відео
+    (найближчим за часом публікації) разом з реальними переглядами —
+    викликається з cmd_publish_ig перед показом списку кандидатів."""
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE videos
+               SET tiktok_public_video_id=?, tiktok_public_views=?, tiktok_public_share_url=?
+               WHERE id=?""",
+            (public_video_id, views, share_url, video_id),
+        )
 
 
 def get_video_by_id(video_id: int) -> Optional[dict]:
@@ -229,6 +307,16 @@ def enqueue(video_id: int, platform: str, scheduled_at: datetime):
         )
 
 
+def enqueue_carousel(carousel_id: int, scheduled_at: datetime):
+    """Ставить готову карусель (уже завантажену в S3, див. create_carousel)
+    у чергу — platform завжди 'instagram_carousel', video_id лишається NULL."""
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO publish_queue (carousel_id, platform, scheduled_at) VALUES (?, 'instagram_carousel', ?)",
+            (carousel_id, scheduled_at.isoformat()),
+        )
+
+
 def get_pending_queue():
     # scheduled_at зберігається через Python's datetime.isoformat() — формат
     # "2026-06-25T08:34:16.224357" (з літерою "T" і мікросекундами), тоді як
@@ -239,15 +327,54 @@ def get_pending_queue():
     # спрацьовувала, і жодне відео з черги ніколи не підхоплювалось.
     # Обгортаємо обидві сторони в datetime(...), що нормалізує формат і
     # коректно парсить ISO8601 з "T"-розділювачем.
+    #
+    # LEFT JOIN на обидві таблиці: tiktok/instagram-записи мають video_id
+    # (carousel-поля будуть NULL), instagram_carousel-записи мають carousel_id
+    # (video-поля будуть NULL) — queue_runner.py розгалужується за platform.
     with get_conn() as conn:
         rows = conn.execute("""
-            SELECT q.*, v.s3_url, v.cover_s3_url, v.transcript, v.tiktok_caption
+            SELECT q.*,
+                   v.s3_url, v.cover_s3_url, v.transcript, v.tiktok_caption,
+                   c.image_urls AS carousel_image_urls, c.caption AS carousel_caption
             FROM publish_queue q
-            JOIN videos v ON v.id = q.video_id
+            LEFT JOIN videos v ON v.id = q.video_id
+            LEFT JOIN carousels c ON c.id = q.carousel_id
             WHERE q.status = 'pending'
               AND datetime(q.scheduled_at) <= datetime('now')
         """).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── Carousels (сторітейли) ───────────────────────────────────────────────────
+
+def create_carousel(image_urls: list, caption: str = "") -> int:
+    """image_urls: список публічних S3 URL слайдів, у порядку показу (2-10)."""
+    import json
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO carousels (image_urls, caption) VALUES (?, ?)",
+            (json.dumps(image_urls), caption),
+        )
+        return cur.lastrowid
+
+
+def get_carousel_by_id(carousel_id: int) -> Optional[dict]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM carousels WHERE id=?", (carousel_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def set_carousel_caption(carousel_id: int, caption: str):
+    with get_conn() as conn:
+        conn.execute("UPDATE carousels SET caption=? WHERE id=?", (caption, carousel_id))
+
+
+def set_carousel_published(carousel_id: int, media_id: str):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE carousels SET instagram_media_id=?, instagram_published_at=datetime('now') WHERE id=?",
+            (media_id, carousel_id),
+        )
 
 
 def mark_queue_done(queue_id: int):

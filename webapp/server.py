@@ -33,7 +33,7 @@ app.secret_key = FLASK_SECRET_KEY
 
 UPDATED = date.today().isoformat()
 
-TIKTOK_SCOPES = "user.info.basic,video.upload"
+TIKTOK_SCOPES = "user.info.basic,video.upload,video.list"
 
 # Instagram API with Instagram Login (Business Login) — заміна старих
 # instagram_basic/instagram_content_publish (deprecated 27.01.2025).

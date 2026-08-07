@@ -2,16 +2,24 @@
 Telegram бот — точка входу.
 
 Команди:
-  /start   — привітання
-  /status  — скільки відео опубліковано сьогодні
-  /queue   — що в черзі
+  /start       — привітання
+  /status      — скільки відео опубліковано сьогодні
+  /queue       — що в черзі
+  /publish_ig  — опублікувати в Instagram Reels TikTok-відео, що "вибухнуло"
+                 (з реальними переглядами, якщо вже опубліковане в TikTok вручну)
+  /nocap       — опублікувати карусель без підпису (пропустити крок підпису)
 
-Сценарій:
+Сценарій відео:
   1. Надсилаєш відео в чат
   2. Бот обробляє: silence removal → субтитри → обкладинка → S3
   3. Бот запитує: "Опублікувати зараз чи поставити в чергу?"
   4. При виборі часу — потрапляє в publish_queue
   5. queue_runner.py публікує у заданий час
+
+Сценарій сторітейл-каруселі (Instagram):
+  1. Надсилаєш кілька готових слайдів ОДНИМ альбомом фото (2-10 штук)
+  2. Бот вивантажує їх на S3, питає підпис (текстом або /nocap)
+  3. Обираєш час публікації — queue_runner.py публікує каруселлю автоматично
 """
 
 import asyncio
@@ -35,7 +43,10 @@ from telegram.ext import (
 )
 
 import db
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, TMP_DIR, TIKTOK_PUBLISH_TIMES, TIKTOK_DAILY_LIMIT
+from config import (
+    TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, TMP_DIR,
+    TIKTOK_PUBLISH_TIMES, TIKTOK_DAILY_LIMIT, INSTAGRAM_PUBLISH_HOUR,
+)
 from pipeline.ffmpeg_processor import to_standard_mp4, remove_silence, normalize_vertical, burn_subtitles, extract_frame
 from pipeline.transcriber import transcribe_to_srt
 from pipeline.cover_generator import generate_cover_ai as generate_cover
@@ -45,6 +56,7 @@ from scheduler.queue_runner import run as queue_runner_run
 from webapp.server import start_in_background as start_webapp
 from publishers.instagram import publish_reel, adapt_caption_for_instagram, get_valid_token_and_user_id
 from publishers.instagram_dm import list_dm_candidates, run_broadcast
+from publishers.tiktok import list_recent_public_videos as tiktok_list_recent_public_videos
 from pipeline.drive_watcher import list_all_videos, download_file as drive_download, is_processing, mark_processing, unmark_processing, extract_file_id
 from config import GOOGLE_DRIVE_FOLDER_ID
 
@@ -67,9 +79,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Привіт! Надішли відео — я його оброблю і поставлю в чергу для публікації.\n\n"
         "Якщо відео >20MB — надішли посилання:\n"
         "`/process_url https://...`\n\n"
+        "Надішли кілька фото одним альбомом — запропоную опублікувати їх як "
+        "сторітейл-карусель в Instagram.\n\n"
         "/status — статус сьогоднішніх публікацій\n"
         "/queue — черга\n"
-        "/publish_ig — опублікувати в Instagram відео, яке вже \"вибухнуло\" в TikTok\n"
+        "/publish_ig — опублікувати в Instagram відео, яке вже \"вибухнуло\" в TikTok "
+        "(з реальними переглядами, якщо відео вже опубліковане в TikTok вручну)\n"
         "/dm_blast <текст> — одноразова розсилка в Instagram Direct усім, хто вже писав",
         parse_mode="Markdown",
     )
@@ -101,7 +116,9 @@ async def cmd_publish_ig(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     TikTok-відео тепер публікується вручну власником (inbox-флоу), тож
     переглядів через API не отримати поки відео не опубліковане публічно.
-    Натомість власник сам каже боту, яке відео "вибухнуло".
+    Тому тут: підтягуємо список ВЖЕ публічних TikTok-відео (video.list,
+    реальні перегляди) і зіставляємо їх з чернетками за найближчим часом —
+    але вибір, яке саме публікувати в Instagram, завжди лишається за власником.
     """
     if not is_allowed(update):
         return
@@ -113,17 +130,85 @@ async def cmd_publish_ig(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    msg = await update.message.reply_text("🔎 Перевіряю реальні перегляди в TikTok...")
+
+    videos = await asyncio.to_thread(_attach_tiktok_views, videos)
+    # Найбільше переглядів — першими; ще не зіставлені (views=None) — в кінці.
+    videos.sort(key=lambda v: (v.get("tiktok_public_views") is None, -(v.get("tiktok_public_views") or 0)))
+
     buttons = []
     for v in videos:
-        caption_preview = (v.get("tiktok_caption") or "").strip().replace("\n", " ")[:30]
+        caption_preview = (v.get("tiktok_caption") or "").strip().replace("\n", " ")[:26]
         published = (v.get("tiktok_published_at") or "")[:16]
-        label = f"{published} — {caption_preview or 'без підпису'}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"publish_ig:{v['id']}")])
+        views = v.get("tiktok_public_views")
+        views_label = f"👁{_format_views(views)}" if views is not None else "❔ не публічне"
+        label = f"{views_label} · {published} · {caption_preview or 'без підпису'}"
+        buttons.append([InlineKeyboardButton(label[:64], callback_data=f"publish_ig:{v['id']}")])
 
-    await update.message.reply_text(
-        "Яке відео опублікувати в Instagram Reels?",
+    await msg.edit_text(
+        "Яке відео опублікувати в Instagram Reels?\n"
+        "👁 — реальні перегляди TikTok (якщо відео вже опубліковане вручну). "
+        "❔ — ще в чернетках або не вдалось зіставити, публікуй на власний розсуд.",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
+
+
+def _attach_tiktok_views(videos: list) -> list:
+    """Синхронна функція (виконується в потоці через asyncio.to_thread):
+    підтягує список публічних TikTok-відео і зіставляє з переданими
+    кандидатами за найближчим часом публікації. Зіставлення зберігається
+    в БД (match_tiktok_public_video), щоб не робити його повторно щоразу."""
+    try:
+        public_videos = tiktok_list_recent_public_videos(max_count=20)
+    except Exception as e:
+        logger.warning(f"Не вдалось отримати video.list з TikTok: {e}")
+        return videos
+
+    used_public_ids = {v["tiktok_public_video_id"] for v in videos if v.get("tiktok_public_video_id")}
+
+    for cand in videos:
+        if cand.get("tiktok_public_video_id"):
+            continue  # вже зіставлено раніше — не перезаписуємо
+
+        try:
+            draft_time = datetime.fromisoformat(cand["tiktok_published_at"])
+        except (TypeError, ValueError):
+            continue
+
+        best, best_diff = None, None
+        for pv in public_videos:
+            if pv["id"] in used_public_ids:
+                continue
+            # Публічна публікація завжди відбувається ПІСЛЯ того, як відео
+            # потрапило в чернетки (± кілька хвилин на похибку годинників).
+            if pv["create_time"] < draft_time - timedelta(minutes=5):
+                continue
+            diff = (pv["create_time"] - draft_time).total_seconds()
+            if best is None or diff < best_diff:
+                best, best_diff = pv, diff
+
+        # Приймаємо збіг лише в межах 7 днів — інакше це, ймовірно, зовсім
+        # інше відео (власник міг публікувати в іншому порядку/з затримкою).
+        if best and best_diff is not None and best_diff <= 7 * 86400:
+            used_public_ids.add(best["id"])
+            views = best.get("view_count", 0)
+            share_url = best.get("share_url", "")
+            db.match_tiktok_public_video(cand["id"], best["id"], views, share_url)
+            cand["tiktok_public_video_id"] = best["id"]
+            cand["tiktok_public_views"] = views
+            cand["tiktok_public_share_url"] = share_url
+
+    return videos
+
+
+def _format_views(n: int) -> str:
+    if n is None:
+        return "?"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
 
 
 async def handle_publish_ig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -263,6 +348,207 @@ async def handle_dm_blast_callback(update: Update, context: ContextTypes.DEFAULT
         report += f"\n\nПриклади помилок (найчастіше — поза 24-годинним вікном):\n{sample}"
 
     await query.edit_message_text(report)
+
+
+# ── Instagram карусель (сторітейл) ───────────────────────────────────────────
+#
+# Сценарій: надсилаєш кілька фото ОДНИМ альбомом у Telegram (готові слайди,
+# з накладеним текстом — підготовлені заздалегідь, напр. в Claude Desktop).
+# Бот збирає весь альбом (Telegram доставляє фото альбому окремими updates —
+# доводиться "дебаунсити"), вивантажує на S3, питає підпис, тоді час
+# публікації — і публікує каруселлю в Instagram Graph API за розкладом
+# (автопублікація, без додаткового підтвердження в момент публікації, як і
+# для TikTok-черги: вибір часу на цьому кроці і Є підтвердженням).
+
+ALBUM_DEBOUNCE_SECONDS = 1.5
+_album_debounce_jobs: dict = {}  # media_group_id → Job (модульний рівень: не залежить від chat_data)
+
+
+async def handle_carousel_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приймає фото (стиснуті `filters.PHOTO` або оригінальні `filters.Document.IMAGE`),
+    накопичує в буфер по media_group_id і через ALBUM_DEBOUNCE_SECONDS після
+    останнього фото альбому запускає _finalize_carousel_album."""
+    if not is_allowed(update):
+        return
+
+    msg = update.message
+    file_id = None
+    if msg.photo:
+        file_id = msg.photo[-1].file_id  # найбільша доступна роздільність
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        file_id = msg.document.file_id
+
+    if not file_id:
+        return
+
+    group_id = msg.media_group_id or f"single-{msg.chat_id}-{msg.message_id}"
+
+    pending = context.chat_data.setdefault("pending_carousel_albums", {})
+    pending.setdefault(group_id, []).append(file_id)
+
+    # Дебаунс: Telegram присилає фото одного альбому окремими updates майже
+    # одночасно — кожне нове фото скасовує попередній таймер і ставить новий,
+    # щоб "фіналізація" спрацювала рівно один раз, після останнього фото.
+    existing_job = _album_debounce_jobs.get(group_id)
+    if existing_job:
+        existing_job.schedule_removal()
+
+    job = context.job_queue.run_once(
+        _finalize_carousel_album,
+        when=ALBUM_DEBOUNCE_SECONDS,
+        chat_id=msg.chat_id,
+        data={"group_id": group_id},
+        name=f"finalize_album_{group_id}",
+    )
+    _album_debounce_jobs[group_id] = job
+
+
+async def _finalize_carousel_album(context: ContextTypes.DEFAULT_TYPE):
+    """Job callback (запускається через job_queue з chat_id=... — тому
+    context.chat_data тут прив'язаний до того самого чату, що й у хендлері
+    handle_carousel_photos вище)."""
+    group_id = context.job.data["group_id"]
+    chat_id = context.job.chat_id
+    _album_debounce_jobs.pop(group_id, None)
+
+    pending = context.chat_data.setdefault("pending_carousel_albums", {})
+    file_ids = pending.pop(group_id, [])
+    if not file_ids:
+        return
+
+    if len(file_ids) < 2:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="📸 Отримав 1 фото. Для сторітейл-каруселі потрібно мінімум 2 слайди — "
+                 "надішли решту одним альбомом (вибрати кілька фото одразу в Telegram).",
+        )
+        return
+    if len(file_ids) > 10:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"📸 Отримав {len(file_ids)} фото, але Instagram-карусель приймає максимум 10 слайдів. "
+                 "Надішли не більше 10.",
+        )
+        return
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"📸 Отримав {len(file_ids)} фото. Завантажую слайди на S3...",
+    )
+
+    image_urls = []
+    try:
+        for i, file_id in enumerate(file_ids):
+            file = await context.bot.get_file(file_id)
+            local_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_slide{i}.jpg")
+            await file.download_to_drive(local_path)
+            try:
+                url = await asyncio.to_thread(upload_file, local_path, "carousel")
+                image_urls.append(url)
+            finally:
+                os.remove(local_path)
+    except Exception as e:
+        logger.error(f"Помилка завантаження слайдів каруселі: {e}", exc_info=True)
+        await msg.edit_text(f"❌ Помилка завантаження слайдів: {e}")
+        return
+
+    carousel_id = db.create_carousel(image_urls, caption="")
+    context.chat_data["pending_carousel_id"] = carousel_id
+
+    await msg.edit_text(
+        f"✅ {len(image_urls)} слайдів завантажено (карусель #{carousel_id}).\n\n"
+        "Надішли підпис текстом — або /nocap, щоб опублікувати без підпису."
+    )
+
+
+async def cmd_nocap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пропускає крок підпису для каруселі, що очікує на нього."""
+    if not is_allowed(update):
+        return
+    carousel_id = context.chat_data.pop("pending_carousel_id", None)
+    if not carousel_id:
+        await update.message.reply_text("Немає каруселі, що очікує на підпис.")
+        return
+    await update.message.reply_text(
+        f"Карусель #{carousel_id} без підпису.\n\nКоли публікуємо в Instagram?",
+        reply_markup=_build_carousel_schedule_keyboard(carousel_id),
+    )
+
+
+async def handle_carousel_caption_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вільний текст обробляємо ЛИШЕ якщо є карусель, що очікує на підпис —
+    інакше нічого не робимо (щоб не заважати іншим сценаріям бота)."""
+    if not is_allowed(update):
+        return
+    carousel_id = context.chat_data.get("pending_carousel_id")
+    if not carousel_id:
+        return
+
+    caption = (update.message.text or "").strip()
+    context.chat_data.pop("pending_carousel_id", None)
+    db.set_carousel_caption(carousel_id, caption)
+
+    await update.message.reply_text(
+        f"📝 Підпис збережено для каруселі #{carousel_id}.\n\nКоли публікуємо в Instagram?",
+        reply_markup=_build_carousel_schedule_keyboard(carousel_id),
+    )
+
+
+def _build_carousel_schedule_keyboard(carousel_id: int) -> InlineKeyboardMarkup:
+    """Кнопки планування для каруселі: дефолтна година з INSTAGRAM_PUBLISH_HOUR,
+    ті самі слоти що й для TikTok (для зручності — один спільний ритм публікацій),
+    і "Зараз"."""
+    buttons = []
+    now = datetime.now()
+
+    default_time = now.replace(hour=INSTAGRAM_PUBLISH_HOUR, minute=0, second=0, microsecond=0)
+    if default_time <= now:
+        default_time += timedelta(days=1)
+    day_label = "завтра" if default_time.date() > now.date() else "сьогодні"
+    buttons.append([InlineKeyboardButton(
+        f"🌅 {day_label} о {INSTAGRAM_PUBLISH_HOUR:02d}:00",
+        callback_data=f"schedule_carousel:{carousel_id}:{default_time.isoformat()}",
+    )])
+
+    for time_str in TIKTOK_PUBLISH_TIMES:
+        h, m = map(int, time_str.split(":"))
+        scheduled = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if scheduled <= now:
+            scheduled += timedelta(days=1)
+        buttons.append([InlineKeyboardButton(
+            f"🕐 {time_str}",
+            callback_data=f"schedule_carousel:{carousel_id}:{scheduled.isoformat()}",
+        )])
+
+    buttons.append([InlineKeyboardButton(
+        "🔴 Зараз", callback_data=f"schedule_carousel:{carousel_id}:now",
+    )])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def handle_carousel_schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_allowed(update):
+        return
+
+    _, carousel_id_str, time_part = query.data.split(":", 2)
+    carousel_id = int(carousel_id_str)
+
+    if time_part == "now":
+        scheduled_at = datetime.now()
+        label = "зараз"
+    else:
+        scheduled_at = datetime.fromisoformat(time_part)
+        label = scheduled_at.strftime("%H:%M %d.%m")
+
+    db.enqueue_carousel(carousel_id, scheduled_at)
+
+    await query.edit_message_text(
+        f"✅ Карусель #{carousel_id} поставлено в чергу на {label}.\n"
+        "Опублікується автоматично в Instagram — підтверджувати повторно не треба."
+    )
 
 
 # ── Обробка відео ─────────────────────────────────────────────────────────────
@@ -785,6 +1071,13 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_schedule_callback, pattern=r"^schedule_tiktok:"))
     app.add_handler(CallbackQueryHandler(handle_publish_ig_callback, pattern=r"^publish_ig:"))
     app.add_handler(CallbackQueryHandler(handle_dm_blast_callback, pattern=r"^dm_blast_(confirm|cancel)$"))
+    app.add_handler(CommandHandler("nocap", cmd_nocap))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_carousel_photos))
+    app.add_handler(CallbackQueryHandler(handle_carousel_schedule_callback, pattern=r"^schedule_carousel:"))
+    # Вільний текст — тільки для підпису каруселі, що очікує на нього (див.
+    # handle_carousel_caption_text: якщо очікування немає — нічого не робить).
+    # Реєструємо останнім, щоб не заважати командам вище.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_carousel_caption_text))
 
     # Drive poller: перевіряє папку кожні 2 хвилини
     if GOOGLE_DRIVE_FOLDER_ID:

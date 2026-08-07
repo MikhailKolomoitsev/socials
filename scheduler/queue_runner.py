@@ -6,10 +6,12 @@
 import logging
 import time
 
+import json
+
 import db
 from pipeline.caption_generator import generate_caption
 from publishers.tiktok import publish_video as tiktok_publish
-from publishers.instagram import publish_reel
+from publishers.instagram import publish_reel, publish_carousel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [QUEUE] %(message)s")
 logger = logging.getLogger(__name__)
@@ -39,6 +41,8 @@ def _process_queue():
                 _publish_tiktok(item)
             elif item["platform"] == "instagram":
                 _publish_instagram(item)
+            elif item["platform"] == "instagram_carousel":
+                _publish_instagram_carousel(item)
             db.mark_queue_done(item["id"])
         except Exception as e:
             logger.error(f"Помилка публікації queue #{item['id']}: {e}")
@@ -67,6 +71,17 @@ def _publish_instagram(item: dict):
     )
     db.set_instagram_published(item["video_id"], media_id, caption)
     logger.info(f"✅ Instagram опубліковано: {media_id}")
+
+
+def _publish_instagram_carousel(item: dict):
+    """Публікує сторітейл-карусель (слайди підготовлені й вивантажені заздалегідь,
+    див. main.py:handle_carousel_photos) — тут лише публікація за розкладом,
+    без жодної додаткової генерації, як і задумано (автопублікація за часом)."""
+    image_urls = json.loads(item["carousel_image_urls"])
+    caption = item.get("carousel_caption") or ""
+    media_id = publish_carousel(image_urls, caption)
+    db.set_carousel_published(item["carousel_id"], media_id)
+    logger.info(f"✅ Instagram карусель опубліковано: {media_id}")
 
 
 def _generate_tiktok_caption(transcript: str) -> str:

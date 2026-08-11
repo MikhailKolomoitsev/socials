@@ -62,12 +62,11 @@ TIKTOK_PUBLISH_TIMES = os.getenv("TIKTOK_PUBLISH_TIMES", "09:00,13:00,18:00").sp
 VIEWS_THRESHOLD = int(os.getenv("VIEWS_THRESHOLD", "500"))
 INSTAGRAM_PUBLISH_HOUR = int(os.getenv("INSTAGRAM_PUBLISH_HOUR", "10"))
 
-# Оптимальна година публікації Instagram Reels для європейської аудиторії
-# (Київ/Берлін — Київ завжди на 1 год попереду Берліна, обидва йдуть за
-# єдиним DST-розкладом ЄС). За даними 2026 року (Buffer/Sprout
-# Social/SocialChamp) — вечірній пік охоплення Reels для континентальної
-# Європи ~19:00-21:00 CET/EET. Час — за Києвом; конвертація в UTC для черги
-# відбувається в main.py:_next_optimal_instagram_time().
+# INSTAGRAM_REELS_HOUR: більше не використовується — Instagram Reels
+# публікується лише вручну (тап "Запостити в Instagram" з нагадування,
+# /ig_pending або /publish_ig), автоматичного планування на "оптимальний
+# час" більше немає. Лишено визначеним на випадок старого .env з цим
+# значенням — прибрати можна безпечно.
 INSTAGRAM_REELS_HOUR = int(os.getenv("INSTAGRAM_REELS_HOUR", "19"))
 
 # Локальні папки

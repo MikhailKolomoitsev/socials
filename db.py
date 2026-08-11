@@ -37,7 +37,12 @@ def init_db():
 
                 -- Аналітика
                 views_at_check INTEGER DEFAULT 0,
-                best_of_day INTEGER DEFAULT 0
+                best_of_day INTEGER DEFAULT 0,
+
+                -- Telegram: де в чаті лежить оригінальне відео (щоб пізніше
+                -- надіслати нагадування-відповідь з переходом до контенту)
+                chat_id INTEGER,
+                message_id INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS carousels (
@@ -115,6 +120,13 @@ def _migrate(conn):
     # розпізнавали TikTok- і Instagram-версію як дублікат одна одної і не
     # різали охоплення. s3_url лишається TikTok-варіантом (як і раніше).
     add_column_if_missing("videos", "s3_url_instagram", "s3_url_instagram TEXT")
+
+    # chat_id/message_id оригінального відео в Telegram — щоб нагадування
+    # "опублікуй це відео" (queue_runner, після TikTok-завантаження) і
+    # /ig_pending могли надіслати reply на оригінальне повідомлення (тап на
+    # цитату = перехід до контенту в чаті).
+    add_column_if_missing("videos", "chat_id", "chat_id INTEGER")
+    add_column_if_missing("videos", "message_id", "message_id INTEGER")
 
     # publish_queue.video_id був NOT NULL у старій схемі — записи для
     # instagram_carousel мають video_id=NULL (замість цього carousel_id).
@@ -205,17 +217,21 @@ def create_video(
     cover_s3_url: str,
     transcript: str,
     s3_url_instagram: str = None,
+    chat_id: int = None,
+    message_id: int = None,
 ) -> int:
     """s3_url — відео зі стилем субтитрів "tiktok" (як і раніше).
     s3_url_instagram — те саме відео, але з іншим стилем субтитрів
     (колір/розмір/позиція), щоб Instagram не розпізнав його як дублікат
     TikTok-версії. Якщо не передано (напр. немає мовлення для субтитрів) —
-    NULL, і publish-код сам падає назад на s3_url."""
+    NULL, і publish-код сам падає назад на s3_url.
+    chat_id/message_id — де в Telegram лежить оригінальне відео (щоб
+    нагадування й /ig_pending могли послатись на нього як reply)."""
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO videos (original_filename, s3_url, cover_s3_url, transcript, s3_url_instagram) "
-            "VALUES (?,?,?,?,?)",
-            (original_filename, s3_url, cover_s3_url, transcript, s3_url_instagram),
+            "INSERT INTO videos (original_filename, s3_url, cover_s3_url, transcript, s3_url_instagram, chat_id, message_id) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (original_filename, s3_url, cover_s3_url, transcript, s3_url_instagram, chat_id, message_id),
         )
         return cur.lastrowid
 
@@ -352,6 +368,7 @@ def get_pending_queue():
         rows = conn.execute("""
             SELECT q.*,
                    v.s3_url, v.s3_url_instagram, v.cover_s3_url, v.transcript, v.tiktok_caption,
+                   v.chat_id, v.message_id,
                    c.image_urls AS carousel_image_urls, c.caption AS carousel_caption
             FROM publish_queue q
             LEFT JOIN videos v ON v.id = q.video_id
@@ -360,6 +377,24 @@ def get_pending_queue():
               AND datetime(q.scheduled_at) <= datetime('now')
         """).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_tiktok_queue_times() -> list:
+    """
+    Час (UTC, наївний datetime) усіх запланованих/уже виконаних TikTok-слотів
+    за останні 2 дні і в майбутньому.
+
+    Використовується автопланувальником (main.py:_next_tiktok_slot), щоб не
+    поставити два відео в один і той самий часовий слот, і щоб рахувати,
+    скільки слотів на сьогодні вже зайнято (для TIKTOK_DAILY_LIMIT).
+    """
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT scheduled_at FROM publish_queue
+            WHERE platform = 'tiktok' AND status IN ('pending', 'done')
+              AND datetime(scheduled_at) >= datetime('now', '-2 days')
+        """).fetchall()
+    return [datetime.fromisoformat(r["scheduled_at"]) for r in rows]
 
 
 # ── Carousels (сторітейли) ───────────────────────────────────────────────────

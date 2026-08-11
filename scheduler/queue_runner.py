@@ -8,7 +8,10 @@ import time
 
 import json
 
+import requests
+
 import db
+from config import TELEGRAM_BOT_TOKEN
 from pipeline.caption_generator import generate_caption
 from publishers.tiktok import publish_video as tiktok_publish
 from publishers.instagram import publish_reel, publish_carousel
@@ -60,6 +63,56 @@ def _publish_tiktok(item: dict):
     )
     db.set_tiktok_published(item["video_id"], video_id, caption)
     logger.info(f"✅ TikTok опубліковано: {video_id}")
+    _send_tiktok_reminder(item)
+
+
+def _send_tiktok_reminder(item: dict):
+    """
+    Нагадування в Telegram одразу після того, як відео дійшло до TikTok-
+    чернеток: "відкрий TikTok і опублікуй" + кнопка, щоб одразу закинути це
+    саме відео в Instagram Reels (не чекаючи /ig_pending).
+
+    Надсилається як reply на оригінальне повідомлення з відео (chat_id/
+    message_id, збережені в videos при обробці) — тап на цитату відкриває
+    сам контент у чаті.
+
+    queue_runner працює в окремому потоці без Telegram Application/event loop
+    (див. main.py:main(), threading.Thread(target=queue_runner_run)) — тому
+    HTTP напряму до Bot API, а не через python-telegram-bot.
+    """
+    chat_id = item.get("chat_id")
+    video_id = item.get("video_id")
+    if not chat_id or not video_id or not TELEGRAM_BOT_TOKEN:
+        return
+
+    payload = {
+        "chat_id": chat_id,
+        "text": (
+            "🎬 Відео завантажилось у TikTok-чернетки!\n\n"
+            "Відкрий TikTok і натисни «Опублікувати».\n\n"
+            "Коли будеш готовий — можна одразу закинути це відео в Instagram Reels:"
+        ),
+        "reply_markup": {
+            "inline_keyboard": [[
+                {"text": "📸 Запостити в Instagram", "callback_data": f"publish_ig:{video_id}"}
+            ]]
+        },
+    }
+    if item.get("message_id"):
+        payload["reply_to_message_id"] = item["message_id"]
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(url, json=payload, timeout=15)
+        if resp.status_code != 200 and "reply_to_message_id" in payload:
+            # Оригінальне повідомлення могло бути видалене/недоступне —
+            # пробуємо ще раз без reply, аби нагадування хоч дійшло.
+            payload.pop("reply_to_message_id")
+            resp = requests.post(url, json=payload, timeout=15)
+        if resp.status_code != 200:
+            logger.warning(f"Не вдалось надіслати нагадування в Telegram: {resp.text}")
+    except Exception as e:
+        logger.warning(f"Помилка надсилання нагадування в Telegram: {e}")
 
 
 def _publish_instagram(item: dict):

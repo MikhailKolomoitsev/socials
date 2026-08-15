@@ -37,7 +37,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests as http_requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.error import BadRequest as TgBadRequest
 from telegram.ext import (
     Application,
@@ -1164,6 +1164,26 @@ async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+async def _post_init(app: Application):
+    """
+    Реєструє команди в Telegram (з'являються в меню "/" при наборі) —
+    інакше команди ПРАЦЮЮТЬ, але їх ніде не видно, поки не знаєш точну
+    назву напам'ять (саме тому /ig_pending лишався непоміченим).
+    """
+    await app.bot.set_my_commands([
+        BotCommand("start", "Довідка — як користуватись ботом"),
+        BotCommand("status", "Скільки опубліковано в TikTok сьогодні"),
+        BotCommand("queue", "Черга запланованих публікацій"),
+        BotCommand("ig_pending", "TikTok-відео, ще не опубліковані в Instagram (з переходом у чат)"),
+        BotCommand("publish_ig", "Те саме списком, з реальними переглядами TikTok"),
+        BotCommand("test_ig", "Перевірка підключення до Instagram (нічого не публікує)"),
+        BotCommand("scan_drive", "Перевірити нові відео в Google Drive"),
+        BotCommand("process_url", "Обробити відео за посиланням (якщо файл >20MB)"),
+        BotCommand("nocap", "Опублікувати карусель без підпису"),
+        BotCommand("dm_blast", "Розсилка в Instagram Direct"),
+    ])
+
+
 def main():
     db.init_db()
 
@@ -1176,7 +1196,7 @@ def main():
     start_webapp()
     logger.info("Веб-сервер (/terms, /privacy) запущено в фоні.")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))

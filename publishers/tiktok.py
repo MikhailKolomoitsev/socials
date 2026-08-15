@@ -11,6 +11,7 @@
 Потрібен лише scope: video.upload
 """
 
+import logging
 import time
 from datetime import datetime
 
@@ -22,6 +23,8 @@ from config import (
     TIKTOK_CLIENT_KEY,
     TIKTOK_CLIENT_SECRET,
 )
+
+logger = logging.getLogger(__name__)
 
 BASE_URL = "https://open.tiktokapis.com/v2"
 
@@ -204,7 +207,7 @@ def list_recent_public_videos(max_count: int = 20) -> list:
     return videos
 
 
-def _wait_for_publish(publish_id: str, headers: dict, max_retries: int = 10) -> str:
+def _wait_for_publish(publish_id: str, headers: dict, max_retries: int = 40, poll_interval: int = 10) -> str:
     """
     Чекає поки TikTok обробить відео і завантажить його у "чернетки".
 
@@ -212,7 +215,22 @@ def _wait_for_publish(publish_id: str, headers: dict, max_retries: int = 10) -> 
     відео успішно дійшло до вхідних TikTok-акаунта — НЕ що його вже
     опубліковано. "publicaly_available_post_id" тут відсутній, бо
     публікацію довершує сам власник вручну в застосунку TikTok.
+
+    max_retries=40 × poll_interval=10с ≈ 6.7 хв бюджету очікування.
+    Попередній ліміт (10×10с=100с) був закороткий: 14.08.2026 queue #24
+    отримав RuntimeError("TikTok publish timed out") і впав у 'failed' —
+    БЕЗ db.set_tiktok_published і без нагадування в Telegram — хоча відео
+    реально ДІЙШЛО до чернеток TikTok (власник бачив його в застосунку).
+    TikTok просто не встиг повернути PUBLISH_COMPLETE за 100с опитування.
+
+    Якщо й після max_retries статус так і не став остаточним — НЕ піднімаємо
+    виняток: init-запит (post/publish/inbox/video/init/) уже підтвердив, що
+    TikTok прийняв відео, тож найімовірніше воно просто обробляється довше
+    за наш бюджет очікування. Повертаємо publish_id як є, щоб queue_runner
+    все одно позначив відео опублікованим і надіслав нагадування — реальним
+    провалом вважаємо лише явну відповідь TikTok FAILED/CANCELLED.
     """
+    status = None
     for attempt in range(max_retries):
         resp = requests.post(
             f"{BASE_URL}/post/publish/status/fetch/",
@@ -230,6 +248,12 @@ def _wait_for_publish(publish_id: str, headers: dict, max_retries: int = 10) -> 
         elif status in ("FAILED", "CANCELLED"):
             raise RuntimeError(f"TikTok publish failed: {data}")
 
-        time.sleep(10)
+        time.sleep(poll_interval)
 
-    raise TimeoutError("TikTok publish timed out")
+    logger.warning(
+        f"TikTok publish_id={publish_id}: статус не підтвердився за "
+        f"{max_retries * poll_interval}с опитування (останній статус: {status!r}). "
+        "Init-запит підтвердив прийняття відео TikTok'ом — вважаємо це "
+        "ймовірним успіхом (не FAILED/CANCELLED) і повертаємо publish_id."
+    )
+    return publish_id

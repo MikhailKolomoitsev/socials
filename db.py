@@ -113,6 +113,11 @@ def _migrate(conn):
     add_column_if_missing("videos", "tiktok_public_views", "tiktok_public_views INTEGER")
     add_column_if_missing("videos", "tiktok_public_share_url", "tiktok_public_share_url TEXT")
 
+    # Лайки/коменти публічного TikTok-відео — для рекомендацій "це залетіло,
+    # постав в Instagram" (див. main.py:cmd_stats).
+    add_column_if_missing("videos", "tiktok_public_likes", "tiktok_public_likes INTEGER")
+    add_column_if_missing("videos", "tiktok_public_comments", "tiktok_public_comments INTEGER")
+
     # instagram_carousel підтримка в черзі публікацій
     add_column_if_missing("publish_queue", "carousel_id", "carousel_id INTEGER")
 
@@ -311,16 +316,21 @@ def get_recent_tiktoks_for_instagram(limit: int = 10):
     return [dict(r) for r in rows]
 
 
-def match_tiktok_public_video(video_id: int, public_video_id: str, views: int, share_url: str):
+def match_tiktok_public_video(
+    video_id: int, public_video_id: str, views: int, share_url: str,
+    likes: int = None, comments: int = None,
+):
     """Зберігає результат зіставлення чернетки з публічним TikTok-відео
-    (найближчим за часом публікації) разом з реальними переглядами —
-    викликається з cmd_publish_ig перед показом списку кандидатів."""
+    (найближчим за часом публікації) разом з реальними переглядами (і,
+    якщо відомі, лайками/коментарями) — викликається з cmd_publish_ig/
+    cmd_stats перед показом списку кандидатів."""
     with get_conn() as conn:
         conn.execute(
             """UPDATE videos
-               SET tiktok_public_video_id=?, tiktok_public_views=?, tiktok_public_share_url=?
+               SET tiktok_public_video_id=?, tiktok_public_views=?, tiktok_public_share_url=?,
+                   tiktok_public_likes=?, tiktok_public_comments=?
                WHERE id=?""",
-            (public_video_id, views, share_url, video_id),
+            (public_video_id, views, share_url, likes, comments, video_id),
         )
 
 
@@ -377,6 +387,37 @@ def get_pending_queue():
               AND datetime(q.scheduled_at) <= datetime('now')
         """).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_pending_tiktok_videos() -> list:
+    """Відео, ще НЕ доставлені в TikTok-чернетки (в черзі, status='pending',
+    platform='tiktok') — для кнопки "Неопубліковані тіктоки". На відміну від
+    get_recent_tiktoks_for_instagram (яка про Instagram), тут саме про сам
+    TikTok: що ще чекає на свій слот queue_runner'а."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT q.id AS queue_id, q.scheduled_at,
+                   v.id, v.original_filename, v.tiktok_caption, v.chat_id, v.message_id
+            FROM publish_queue q
+            JOIN videos v ON v.id = q.video_id
+            WHERE q.platform = 'tiktok' AND q.status = 'pending'
+            ORDER BY q.scheduled_at ASC
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_tiktok_scheduled_today() -> int:
+    """Скільки TikTok-публікацій заплановано на сьогодні (за Києвом/UTC-датою
+    черги) — і вже виконаних (пішли в чернетки), і ще ні. Використовується
+    щоденним нагадуванням "опублікуй сьогодні N тіктоків"."""
+    with get_conn() as conn:
+        row = conn.execute("""
+            SELECT COUNT(*) as cnt FROM publish_queue
+            WHERE platform = 'tiktok'
+              AND status IN ('pending', 'done')
+              AND date(scheduled_at) = date('now')
+        """).fetchone()
+    return row["cnt"]
 
 
 def get_tiktok_queue_times() -> list:

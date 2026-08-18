@@ -1,14 +1,24 @@
 """
 Telegram бот — точка входу.
 
+Постійне меню кнопок (під полем вводу, з'являється після /start):
+  📋 Неопубліковані тіктоки — /tiktok_pending, черга на TikTok-чернетки
+  🎬 Неопубліковані Reels  — /ig_pending, TikTok-відео ще не в Instagram
+  📊 Статистика            — /stats, перегляди/лайки/коменти + рекомендації
+
 Команди:
-  /start       — привітання
-  /status      — скільки відео опубліковано сьогодні
-  /queue       — що в черзі
-  /ig_pending  — TikTok-відео, ще не опубліковані в Instagram, кожне з
-                 переходом до відео в чаті (reply) і кнопкою "Запостити"
-  /publish_ig  — те саме одним списком, з реальними переглядами TikTok
-  /nocap       — опублікувати карусель без підпису (пропустити крок підпису)
+  /start          — привітання, показує меню кнопок
+  /status         — скільки відео опубліковано сьогодні
+  /queue          — що в черзі (усі платформи)
+  /tiktok_pending — відео, ще НЕ доставлені в TikTok-чернетки, кожне з
+                    переходом до відео в чаті (reply)
+  /ig_pending     — TikTok-відео, ще не опубліковані в Instagram, кожне з
+                    переходом до відео в чаті (reply) і кнопкою "Запостити"
+  /publish_ig     — те саме одним списком, з реальними переглядами TikTok
+  /stats          — перегляди/лайки/коменти TikTok (video.list) для
+                    неопублікованих в Instagram відео; топ-3 за переглядами
+                    позначені 🔥 як рекомендовані кандидати на Instagram
+  /nocap          — опублікувати карусель без підпису (пропустити крок підпису)
 
 Сценарій відео:
   1. Надсилаєш відео в чат
@@ -19,7 +29,10 @@ Telegram бот — точка входу.
      автопостинг без App Review неможливий) і надсилає в чат нагадування
      "опублікуй" з кнопкою для Instagram Reels
   5. Instagram публікується ЛИШЕ вручну — тапом кнопки "Запостити в
-     Instagram" (з нагадування, /ig_pending або /publish_ig), ніколи автоматично
+     Instagram" (з нагадування, /ig_pending, /publish_ig або /stats), ніколи
+     автоматично
+  6. Щодня о 13:00 за Києвом (18:00 за Балі) — проактивне нагадування
+     "опублікуй сьогодні N тіктоків", якщо на сьогодні щось заплановано
 
 Сценарій сторітейл-каруселі (Instagram):
   1. Надсилаєш кілька готових слайдів ОДНИМ альбомом фото (2-10 штук)
@@ -33,11 +46,11 @@ import logging
 import os
 import threading
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 
 import requests as http_requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ReplyKeyboardMarkup
 from telegram.error import BadRequest as TgBadRequest
 from telegram.ext import (
     Application,
@@ -76,6 +89,25 @@ def is_allowed(update: Update) -> bool:
     return update.effective_user.id == TELEGRAM_ALLOWED_USER_ID
 
 
+# ── Постійне меню кнопок ─────────────────────────────────────────────────────
+#
+# Замість того, щоб пам'ятати слеш-команди напам'ять — три кнопки завжди на
+# екрані під полем вводу. Натискання надсилає звичайне текстове повідомлення
+# з міткою кнопки, тому це ловиться MessageHandler(filters.Text([...]))
+# (main(), зареєстрований ПЕРЕД вільним текстовим хендлером каруселі).
+
+BTN_TIKTOK_PENDING = "📋 Неопубліковані тіктоки"
+BTN_IG_PENDING = "🎬 Неопубліковані Reels"
+BTN_STATS = "📊 Статистика"
+
+
+def _main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[BTN_TIKTOK_PENDING], [BTN_IG_PENDING], [BTN_STATS]],
+        resize_keyboard=True,
+    )
+
+
 # ── Команди ───────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -98,8 +130,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "кожне з переходом до відео в чаті й кнопкою «Запостити»\n"
         "/publish_ig — те саме одним списком з реальними переглядами TikTok\n"
         "/test_ig — безпечна перевірка, чи працює публікація в Instagram (нічого не публікує)\n"
-        "/dm_blast <текст> — одноразова розсилка в Instagram Direct усім, хто вже писав",
+        "/dm_blast <текст> — одноразова розсилка в Instagram Direct усім, хто вже писав\n\n"
+        f"Кнопки внизу:\n"
+        f"{BTN_TIKTOK_PENDING} — що ще чекає на завантаження в TikTok-чернетки\n"
+        f"{BTN_IG_PENDING} — TikTok-відео, ще не опубліковані в Instagram, з переходом до відео в чаті\n"
+        f"{BTN_STATS} — перегляди/лайки/коменти TikTok і що варто запостити в Instagram",
         parse_mode="Markdown",
+        reply_markup=_main_menu_keyboard(),
     )
 
 
@@ -205,10 +242,14 @@ def _attach_tiktok_views(videos: list) -> list:
         if best and best_diff is not None and best_diff <= 7 * 86400:
             used_public_ids.add(best["id"])
             views = best.get("view_count", 0)
+            likes = best.get("like_count", 0)
+            comments = best.get("comment_count", 0)
             share_url = best.get("share_url", "")
-            db.match_tiktok_public_video(cand["id"], best["id"], views, share_url)
+            db.match_tiktok_public_video(cand["id"], best["id"], views, share_url, likes, comments)
             cand["tiktok_public_video_id"] = best["id"]
             cand["tiktok_public_views"] = views
+            cand["tiktok_public_likes"] = likes
+            cand["tiktok_public_comments"] = comments
             cand["tiktok_public_share_url"] = share_url
 
     return videos
@@ -271,6 +312,107 @@ async def cmd_ig_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=text,
                 reply_markup=markup,
             )
+
+
+async def cmd_tiktok_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Кнопка "Неопубліковані тіктоки" — список відео, які ще НЕ дійшли до
+    TikTok-чернеток (лежать у publish_queue зі status='pending',
+    platform='tiktok'), з часом слоту й переходом (reply) до відео в чаті.
+
+    На відміну від /ig_pending (яка про Instagram), ця — про сам TikTok:
+    що ще чекає своєї черги queue_runner'а.
+    """
+    if not is_allowed(update):
+        return
+
+    items = db.get_pending_tiktok_videos()
+    if not items:
+        await update.message.reply_text(
+            "✅ Черга TikTok порожня — усе оброблене відео вже в чернетках."
+        )
+        return
+
+    await update.message.reply_text(
+        f"📋 Ще не в TikTok-чернетках: {len(items)}.\n"
+        "Тапни цитату під кожним повідомленням нижче, щоб перейти до відео в чаті."
+    )
+
+    for it in items:
+        caption_preview = (it.get("tiktok_caption") or "").strip().replace("\n", " ")[:120]
+        scheduled = (it.get("scheduled_at") or "")[:16].replace("T", " ")
+        text = f"🕐 Заплановано на {scheduled} (UTC)\n{caption_preview or 'без підпису'}"
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=text,
+                reply_to_message_id=it.get("message_id"),
+            )
+        except TgBadRequest:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Кнопка "Статистика" — реальні перегляди/лайки/коменти TikTok-відео, ще
+    не опублікованих в Instagram, і рекомендація: топ-3 за переглядами
+    позначаються як "залетіло" — кандидати на Instagram Reels.
+    """
+    if not is_allowed(update):
+        return
+
+    videos = db.get_recent_tiktoks_for_instagram(limit=15)
+    if not videos:
+        await update.message.reply_text(
+            "Немає відео, закинутих у TikTok, які ще не опубліковані в Instagram."
+        )
+        return
+
+    msg = await update.message.reply_text("🔎 Перевіряю реальні перегляди/лайки/коменти в TikTok...")
+
+    videos = await asyncio.to_thread(_attach_tiktok_views, videos)
+    matched = [v for v in videos if v.get("tiktok_public_views") is not None]
+    unmatched = [v for v in videos if v.get("tiktok_public_views") is None]
+    matched.sort(key=lambda v: -(v.get("tiktok_public_views") or 0))
+
+    if not matched:
+        await msg.edit_text(
+            "Жодне з невиданих в Instagram TikTok-відео ще не зіставлено з "
+            "публічним TikTok-акаунтом (усі ще в чернетках або зіставлення не "
+            "вдалось). Публікуй у TikTok в застосунку — статистика підтягнеться "
+            "після цього."
+        )
+        return
+
+    TOP_N = 3
+    lines = ["📊 Перегляди/лайки/коменти TikTok (не опубліковано в Instagram):\n"]
+    buttons = []
+    for i, v in enumerate(matched):
+        caption_preview = (v.get("tiktok_caption") or "").strip().replace("\n", " ")[:40]
+        views = v.get("tiktok_public_views") or 0
+        likes = v.get("tiktok_public_likes")
+        comments = v.get("tiktok_public_comments")
+        stats_str = f"👁{_format_views(views)}"
+        if likes is not None:
+            stats_str += f" ❤️{_format_views(likes)}"
+        if comments is not None:
+            stats_str += f" 💬{_format_views(comments)}"
+        recommended = i < TOP_N
+        prefix = "🔥 " if recommended else "• "
+        lines.append(f"{prefix}{stats_str} · {caption_preview or 'без підпису'}")
+        if recommended:
+            label = f"🔥 {stats_str} · {caption_preview or 'без підпису'}"
+            buttons.append([InlineKeyboardButton(label[:64], callback_data=f"publish_ig:{v['id']}")])
+
+    if unmatched:
+        lines.append(f"\n❔ Ще {len(unmatched)} відео не зіставлено з публічним TikTok (в чернетках або похибка зіставлення).")
+
+    lines.append("\n🔥 — топ-3 за переглядами серед неопублікованих в Instagram. Раджу запостити:")
+
+    await msg.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+    )
 
 
 async def cmd_test_ig(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1000,6 +1142,35 @@ def _next_tiktok_slot() -> tuple:
     raise RuntimeError("Не вдалось знайти вільний TikTok-слот у найближчі 15 днів")
 
 
+# ── Щоденне нагадування "опублікуй тіктоки" ──────────────────────────────────
+#
+# 18:00 за Балі (UTC+8, без переведення стрілок) = 13:00 за Києвом — вечір на
+# Балі, робочий день в Україні/Європі, тож обидва часових пояси зручні.
+# Одноразове проактивне нагадування на день — на відміну від
+# scheduler/queue_runner.py:_send_tiktok_reminder (реактивне, одразу після
+# кожної окремої публікації в чернетки).
+
+DAILY_REMINDER_HOUR_KYIV = 13
+DAILY_REMINDER_MINUTE_KYIV = 0
+
+
+async def _daily_tiktok_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    scheduled_today = db.count_tiktok_scheduled_today()
+    if scheduled_today == 0:
+        return  # нічого не заплановано на сьогодні — нагадувати нема про що
+
+    await context.bot.send_message(
+        chat_id=TELEGRAM_ALLOWED_USER_ID,
+        text=(
+            f"🔔 Нагадування: на сьогодні заплановано {scheduled_today} "
+            f"{'тікток' if scheduled_today == 1 else 'тіктоки'}.\n\n"
+            "Відкрий TikTok і натисни «Опублікувати» для всіх відео, що вже "
+            "лежать у чернетках — вони не постяться самі, це обмеження платформи."
+        ),
+        reply_markup=_main_menu_keyboard(),
+    )
+
+
 # ── Google Drive auto-poller ──────────────────────────────────────────────────
 
 DRIVE_POLL_INTERVAL = 120  # секунди між перевірками папки
@@ -1176,6 +1347,8 @@ async def _post_init(app: Application):
         BotCommand("queue", "Черга запланованих публікацій"),
         BotCommand("ig_pending", "TikTok-відео, ще не опубліковані в Instagram (з переходом у чат)"),
         BotCommand("publish_ig", "Те саме списком, з реальними переглядами TikTok"),
+        BotCommand("tiktok_pending", "Відео, ще не доставлені в TikTok-чернетки"),
+        BotCommand("stats", "Перегляди/лайки/коменти TikTok + що варто запостити в Instagram"),
         BotCommand("test_ig", "Перевірка підключення до Instagram (нічого не публікує)"),
         BotCommand("scan_drive", "Перевірити нові відео в Google Drive"),
         BotCommand("process_url", "Обробити відео за посиланням (якщо файл >20MB)"),
@@ -1203,6 +1376,8 @@ def main():
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("publish_ig", cmd_publish_ig))
     app.add_handler(CommandHandler("ig_pending", cmd_ig_pending))
+    app.add_handler(CommandHandler("tiktok_pending", cmd_tiktok_pending))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("test_ig", cmd_test_ig))
     app.add_handler(CommandHandler("dm_blast", cmd_dm_blast))
     app.add_handler(CommandHandler("process_url", cmd_process_url))
@@ -1214,6 +1389,11 @@ def main():
     app.add_handler(CommandHandler("nocap", cmd_nocap))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_carousel_photos))
     app.add_handler(CallbackQueryHandler(handle_carousel_schedule_callback, pattern=r"^schedule_carousel:"))
+    # Постійне меню кнопок — текстові мітки кнопок ловимо ДО вільного тексту
+    # каруселі нижче, інакше натискання кнопки сприймалось би за підпис.
+    app.add_handler(MessageHandler(filters.Text([BTN_TIKTOK_PENDING]), cmd_tiktok_pending))
+    app.add_handler(MessageHandler(filters.Text([BTN_IG_PENDING]), cmd_ig_pending))
+    app.add_handler(MessageHandler(filters.Text([BTN_STATS]), cmd_stats))
     # Вільний текст — тільки для підпису каруселі, що очікує на нього (див.
     # handle_carousel_caption_text: якщо очікування немає — нічого не робить).
     # Реєструємо останнім, щоб не заважати командам вище.
@@ -1228,6 +1408,16 @@ def main():
             name="drive_poller",
         )
         logger.info(f"Drive poller: перевірка кожні {DRIVE_POLL_INTERVAL}с.")
+
+    # Щоденне нагадування "опублікуй тіктоки" — 13:00 за Києвом (18:00 Балі)
+    app.job_queue.run_daily(
+        _daily_tiktok_reminder_job,
+        time=dt_time(hour=DAILY_REMINDER_HOUR_KYIV, minute=DAILY_REMINDER_MINUTE_KYIV, tzinfo=_KYIV_TZ),
+        name="daily_tiktok_reminder",
+    )
+    logger.info(
+        f"Щоденне нагадування: {DAILY_REMINDER_HOUR_KYIV:02d}:{DAILY_REMINDER_MINUTE_KYIV:02d} за Києвом."
+    )
 
     logger.info("Бот запущено. Очікую відео...")
     app.run_polling(drop_pending_updates=True)

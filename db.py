@@ -519,6 +519,25 @@ def get_sent_instagram_videos(limit: int = 20, offset: int = 0) -> list:
     return [dict(r) for r in rows]
 
 
+def get_unpublished_youtube_videos(limit: int = 15, offset: int = 0) -> list:
+    """Відео, ще НЕ опубліковані в YouTube Shorts (youtube_video_id IS NULL),
+    але ВЖЕ відправлені в TikTok (tiktok_video_id IS NOT NULL) — за проханням
+    власника показувати в цьому списку лише те, що вже підтверджено як
+    контент, готовий публікуватись (TikTok-чернетка вже пішла), а не будь-яке
+    щойно оброблене відео. Найчастіше сюди потрапляють відео, оброблені ДО
+    підключення /auth/youtube/login, або ті, де автопублікація впала
+    (main.py:_auto_publish_youtube)."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM videos
+            WHERE youtube_video_id IS NULL
+              AND tiktok_video_id IS NOT NULL
+            ORDER BY created_at ASC
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ── Carousels (сторітейли) ───────────────────────────────────────────────────
 
 def create_carousel(image_urls: list, caption: str = "") -> int:

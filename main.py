@@ -6,6 +6,7 @@ Telegram бот — точка входу.
   ✅ Відправлені тіктоки     /tiktok_sent     — вже в TikTok, є "відправити повторно"
   🎬 Неопубліковані Reels    /ig_pending      — TikTok-відео ще не в Instagram
   📸 Опубліковані Reels      /ig_sent         — вже в Instagram, є "відправити повторно"
+  📺 Неопубліковані Shorts   /youtube_pending — вже в TikTok, ще НЕ в YouTube Shorts
   📊 Статистика              /stats           — перегляди/лайки/коменти + рекомендації
   ⚠️ Невдалі відео           /failed_videos   — обробка впала, є "спробувати ще раз"
 Кожен список пагінований (кнопка "▶️ Показати ще", якщо є більше).
@@ -38,12 +39,15 @@ Telegram бот — точка входу.
   8. Якщо пайплайн обробки впав — відео потрапляє у "⚠️ Невдалі відео" з
      кнопкою "Спробувати ще раз" (повторне завантаження з джерела: Telegram
      file_id / Google Drive file_id / URL — і той самий пайплайн заново)
-  9. YouTube Shorts — ЄДИНА платформа з ПОВНІСТЮ автоматичною публічною
-     публікацією (жодної кнопки): одразу після обробки, ще до видалення
+  9. YouTube Shorts — за замовчуванням ПОВНІСТЮ автоматична публічна
+     публікація (жодної кнопки): одразу після обробки, ще до видалення
      тимчасових файлів (publishers/youtube.py — YouTube Data API не вміє
      "pull from URL", тільки прямий upload локального файлу). Працює лише
      після /auth/youtube/login; якщо OAuth не пройдено — крок мовчки
-     пропускається, решта пайплайну не ламається
+     пропускається, решта пайплайну не ламається. Якщо автопублікація все ж
+     не спрацювала (OAuth підключили пізніше, збій мережі) — відео, що вже
+     відправлені в TikTok, лишаються в "📺 Неопубліковані Shorts" з кнопкою
+     ручної публікації (довантажує файл з S3, бо локальний вже видалений)
 
 Сценарій сторітейл-каруселі (Instagram):
   1. Надсилаєш кілька готових слайдів ОДНИМ альбомом фото (2-10 штук)
@@ -115,6 +119,7 @@ BTN_TIKTOK_PENDING = "📋 Неопубліковані тіктоки"
 BTN_TIKTOK_SENT = "✅ Відправлені тіктоки"
 BTN_IG_PENDING = "🎬 Неопубліковані Reels"
 BTN_IG_SENT = "📸 Опубліковані Reels"
+BTN_YOUTUBE_PENDING = "📺 Неопубліковані Shorts"
 BTN_STATS = "📊 Статистика"
 BTN_FAILED = "⚠️ Невдалі відео"
 
@@ -130,7 +135,8 @@ def _main_menu_keyboard() -> ReplyKeyboardMarkup:
         [
             [BTN_TIKTOK_PENDING, BTN_TIKTOK_SENT],
             [BTN_IG_PENDING, BTN_IG_SENT],
-            [BTN_STATS, BTN_FAILED],
+            [BTN_YOUTUBE_PENDING, BTN_STATS],
+            [BTN_FAILED],
         ],
         resize_keyboard=True,
     )
@@ -162,6 +168,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{BTN_TIKTOK_SENT} — відео, вже відправлені в TikTok, з темою кожного і кнопкою «Відправити повторно»\n"
         f"{BTN_IG_PENDING} — TikTok-відео, ще не опубліковані в Instagram, з переходом до відео в чаті\n"
         f"{BTN_IG_SENT} — відео, вже опубліковані в Instagram, з кнопкою «Відправити повторно»\n"
+        f"{BTN_YOUTUBE_PENDING} — відео, вже в TikTok, ще НЕ в YouTube Shorts, з кнопкою публікації\n"
         f"{BTN_STATS} — перегляди/лайки/коменти TikTok і що варто запостити в Instagram\n"
         f"{BTN_FAILED} — відео, де обробка впала, з кнопкою «Спробувати ще раз»\n\n"
         "Раз на ~3 дні також нагадаю обрати відео для Instagram Reels і/або "
@@ -494,6 +501,95 @@ async def handle_ig_sent_page_callback(update: Update, context: ContextTypes.DEF
     offset = int(query.data.split(":", 1)[1])
     text, markup = _build_ig_sent_page(offset)
     await query.edit_message_text(text, reply_markup=markup)
+
+
+def _build_youtube_pending_page(offset: int) -> tuple:
+    """Повертає (text, markup) для сторінки "Неопубліковані Shorts"
+    (youtube_video_id IS NULL, АЛЕ tiktok_video_id IS NOT NULL — за проханням
+    власника лише те, що вже відправлено в TikTok, не будь-яке щойно
+    оброблене відео). Кнопка на кожне — publish_yt:<id>
+    (handle_publish_youtube_callback)."""
+    videos = db.get_unpublished_youtube_videos(limit=PAGE_SIZE, offset=offset)
+    if not videos:
+        text = "✅ Усі відправлені в TikTok відео вже в YouTube Shorts." if offset == 0 else "Більше немає."
+        return text, None
+
+    buttons = []
+    for v in videos:
+        created = (v.get("created_at") or "")[:16]
+        label = f"{created} · {_video_topic(v)[:36]}"
+        buttons.append([InlineKeyboardButton(label[:64], callback_data=f"publish_yt:{v['id']}")])
+    if len(videos) == PAGE_SIZE:
+        buttons.append([InlineKeyboardButton("▶️ Показати ще", callback_data=f"yp_page:{offset + PAGE_SIZE}")])
+
+    count_label = f"(з {offset + 1})" if offset else str(len(videos))
+    return f"📺 Ще не в YouTube Shorts {count_label}.\nОбери яке опублікувати:", InlineKeyboardMarkup(buttons)
+
+
+async def cmd_youtube_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    text, markup = _build_youtube_pending_page(0)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def handle_youtube_pending_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(update):
+        return
+    offset = int(query.data.split(":", 1)[1])
+    text, markup = _build_youtube_pending_page(offset)
+    await query.edit_message_text(text, reply_markup=markup)
+
+
+async def handle_publish_youtube_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Кнопка "📺" зі списку "Неопубліковані Shorts" (publish_yt:<video_id>) —
+    ручна публікація в YouTube Shorts, для випадків, коли автопублікація
+    (_auto_publish_youtube, одразу після обробки) не спрацювала — OAuth ще
+    не був пройдений, або сталась помилка мережі/API.
+
+    На відміну від _auto_publish_youtube (працює з ЛОКАЛЬНИМ файлом, що ще
+    не видалений) тут доводиться довантажити відео з S3 наново (local_path з
+    моменту обробки вже прибраний у finally) — той самий _download_direct_url,
+    що й /process_url для прямих посилань.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    if not is_allowed(update):
+        return
+
+    video_id = int(query.data.split(":", 1)[1])
+    video = db.get_video_by_id(video_id)
+    if not video:
+        await query.edit_message_text("❌ Відео не знайдено.")
+        return
+    if video.get("youtube_video_id"):
+        await query.edit_message_text("✅ Це відео вже опубліковано в YouTube.")
+        return
+
+    await query.edit_message_text("⏳ Завантажую і публікую в YouTube Shorts...")
+
+    local_path = None
+    try:
+        local_path = await asyncio.to_thread(_download_direct_url, video["s3_url"])
+        title = video.get("tiktok_caption") or video.get("original_filename") or "Short"
+        yt_video_id = await asyncio.to_thread(
+            youtube_publish_short, local_path, title, video.get("transcript") or "",
+        )
+        db.set_youtube_published(video_id, yt_video_id)
+        await query.edit_message_text(f"✅ Опубліковано в YouTube Shorts: https://youtube.com/shorts/{yt_video_id}")
+    except Exception as e:
+        logger.error(f"Помилка публікації в YouTube: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Помилка публікації в YouTube: {e}")
+    finally:
+        if local_path:
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
 
 
 STATS_TOP_N = 3
@@ -1780,6 +1876,7 @@ async def _post_init(app: Application):
         BotCommand("tiktok_sent", "Відео, вже відправлені в TikTok (є «відправити повторно»)"),
         BotCommand("ig_pending", "TikTok-відео, ще не опубліковані в Instagram (з переходом у чат)"),
         BotCommand("ig_sent", "Відео, вже опубліковані в Instagram (є «відправити повторно»)"),
+        BotCommand("youtube_pending", "Відео в TikTok, ще не опубліковані в YouTube Shorts"),
         BotCommand("publish_ig", "Те саме, що ig_pending, одним списком з реальними переглядами TikTok"),
         BotCommand("stats", "Перегляди/лайки/коменти TikTok + що варто запостити в Instagram"),
         BotCommand("failed_videos", "Відео, де обробка впала (є «спробувати ще раз»)"),
@@ -1811,6 +1908,7 @@ def main():
     app.add_handler(CommandHandler("publish_ig", cmd_publish_ig))
     app.add_handler(CommandHandler("ig_pending", cmd_ig_pending))
     app.add_handler(CommandHandler("ig_sent", cmd_ig_sent))
+    app.add_handler(CommandHandler("youtube_pending", cmd_youtube_pending))
     app.add_handler(CommandHandler("tiktok_pending", cmd_tiktok_pending))
     app.add_handler(CommandHandler("tiktok_sent", cmd_tiktok_sent))
     app.add_handler(CommandHandler("stats", cmd_stats))
@@ -1823,10 +1921,12 @@ def main():
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(CallbackQueryHandler(handle_publish_ig_callback, pattern=r"^publish_ig:"))
     app.add_handler(CallbackQueryHandler(handle_publish_tiktok_callback, pattern=r"^publish_tt:"))
+    app.add_handler(CallbackQueryHandler(handle_publish_youtube_callback, pattern=r"^publish_yt:"))
     app.add_handler(CallbackQueryHandler(handle_retry_failed_callback, pattern=r"^retry_failed:"))
     app.add_handler(CallbackQueryHandler(handle_tiktok_pending_page_callback, pattern=r"^tp_page:"))
     app.add_handler(CallbackQueryHandler(handle_tiktok_sent_page_callback, pattern=r"^ts_page:"))
     app.add_handler(CallbackQueryHandler(handle_ig_sent_page_callback, pattern=r"^is_page:"))
+    app.add_handler(CallbackQueryHandler(handle_youtube_pending_page_callback, pattern=r"^yp_page:"))
     app.add_handler(CallbackQueryHandler(handle_stats_page_callback, pattern=r"^st_page:"))
     app.add_handler(CallbackQueryHandler(handle_failed_videos_page_callback, pattern=r"^fv_page:"))
     app.add_handler(CallbackQueryHandler(handle_dm_blast_callback, pattern=r"^dm_blast_(confirm|cancel)$"))
@@ -1839,6 +1939,7 @@ def main():
     app.add_handler(MessageHandler(filters.Text([BTN_TIKTOK_SENT]), cmd_tiktok_sent))
     app.add_handler(MessageHandler(filters.Text([BTN_IG_PENDING]), cmd_ig_pending))
     app.add_handler(MessageHandler(filters.Text([BTN_IG_SENT]), cmd_ig_sent))
+    app.add_handler(MessageHandler(filters.Text([BTN_YOUTUBE_PENDING]), cmd_youtube_pending))
     app.add_handler(MessageHandler(filters.Text([BTN_STATS]), cmd_stats))
     app.add_handler(MessageHandler(filters.Text([BTN_FAILED]), cmd_failed_videos))
     # Вільний текст — тільки для підпису каруселі, що очікує на нього (див.

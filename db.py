@@ -158,6 +158,17 @@ def _migrate(conn):
             ALTER TABLE publish_queue_new RENAME TO publish_queue;
         """)
 
+    # TikTok більше не публікується за автоматичним розкладом (лише кнопкою
+    # "Відправити в TikTok" вручну) — будь-які старі pending-записи в черзі
+    # (заплановані попередньою версією логіки, ще до цієї зміни) скасовуємо,
+    # інакше queue_runner міг би відправити їх без відома власника, щойно
+    # настане їхній час. Ідемпотентно: після першого прогону рядків для
+    # UPDATE вже немає, ніяких нових 'tiktok'-записів у чергу не додається.
+    conn.execute("""
+        UPDATE publish_queue SET status='failed'
+        WHERE platform = 'tiktok' AND status = 'pending'
+    """)
+
 
 # ── TikTok OAuth tokens ──────────────────────────────────────────────────────
 
@@ -342,14 +353,6 @@ def get_video_by_id(video_id: int) -> Optional[dict]:
 
 # ── Queue ─────────────────────────────────────────────────────────────────────
 
-def enqueue(video_id: int, platform: str, scheduled_at: datetime):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO publish_queue (video_id, platform, scheduled_at) VALUES (?,?,?)",
-            (video_id, platform, scheduled_at.isoformat()),
-        )
-
-
 def enqueue_carousel(carousel_id: int, scheduled_at: datetime):
     """Ставить готову карусель (уже завантажену в S3, див. create_carousel)
     у чергу — platform завжди 'instagram_carousel', video_id лишається NULL."""
@@ -389,53 +392,19 @@ def get_pending_queue():
     return [dict(r) for r in rows]
 
 
-def get_pending_tiktok_videos() -> list:
-    """Відео, ще НЕ доставлені в TikTok-чернетки (в черзі, status='pending',
-    platform='tiktok') — для кнопки "Неопубліковані тіктоки". На відміну від
-    get_recent_tiktoks_for_instagram (яка про Instagram), тут саме про сам
-    TikTok: що ще чекає на свій слот queue_runner'а."""
+def get_unpublished_tiktok_videos(limit: int = 15) -> list:
+    """Оброблені відео, ще НЕ відправлені в TikTok (tiktok_video_id IS NULL) —
+    для кнопки "Неопубліковані тіктоки". Відправка повністю ручна (кнопка
+    publish_tt:<id>, main.py:handle_publish_tiktok_callback) — жодного
+    автоматичного розкладу/черги для TikTok більше немає."""
     with get_conn() as conn:
         rows = conn.execute("""
-            SELECT q.id AS queue_id, q.scheduled_at,
-                   v.id, v.original_filename, v.tiktok_caption, v.chat_id, v.message_id
-            FROM publish_queue q
-            JOIN videos v ON v.id = q.video_id
-            WHERE q.platform = 'tiktok' AND q.status = 'pending'
-            ORDER BY q.scheduled_at ASC
-        """).fetchall()
+            SELECT * FROM videos
+            WHERE tiktok_video_id IS NULL
+            ORDER BY created_at ASC
+            LIMIT ?
+        """, (limit,)).fetchall()
     return [dict(r) for r in rows]
-
-
-def count_tiktok_scheduled_today() -> int:
-    """Скільки TikTok-публікацій заплановано на сьогодні (за Києвом/UTC-датою
-    черги) — і вже виконаних (пішли в чернетки), і ще ні. Використовується
-    щоденним нагадуванням "опублікуй сьогодні N тіктоків"."""
-    with get_conn() as conn:
-        row = conn.execute("""
-            SELECT COUNT(*) as cnt FROM publish_queue
-            WHERE platform = 'tiktok'
-              AND status IN ('pending', 'done')
-              AND date(scheduled_at) = date('now')
-        """).fetchone()
-    return row["cnt"]
-
-
-def get_tiktok_queue_times() -> list:
-    """
-    Час (UTC, наївний datetime) усіх запланованих/уже виконаних TikTok-слотів
-    за останні 2 дні і в майбутньому.
-
-    Використовується автопланувальником (main.py:_next_tiktok_slot), щоб не
-    поставити два відео в один і той самий часовий слот, і щоб рахувати,
-    скільки слотів на сьогодні вже зайнято (для TIKTOK_DAILY_LIMIT).
-    """
-    with get_conn() as conn:
-        rows = conn.execute("""
-            SELECT scheduled_at FROM publish_queue
-            WHERE platform = 'tiktok' AND status IN ('pending', 'done')
-              AND datetime(scheduled_at) >= datetime('now', '-2 days')
-        """).fetchall()
-    return [datetime.fromisoformat(r["scheduled_at"]) for r in rows]
 
 
 # ── Carousels (сторітейли) ───────────────────────────────────────────────────

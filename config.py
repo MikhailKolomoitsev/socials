@@ -57,7 +57,15 @@ INSTAGRAM_CLIENT_SECRET = os.getenv("INSTAGRAM_CLIENT_SECRET")
 INSTAGRAM_REDIRECT_URI = os.getenv("INSTAGRAM_REDIRECT_URI")  # напр. https://<railway-domain>/auth/instagram/callback
 
 # Логіка публікацій
+#
+# TikTok більше НЕ публікується автоматично за розкладом — власник сам тисне
+# кнопку "Відправити в TikTok" на конкретне відео, коли захоче (main.py:
+# handle_publish_tiktok_callback). TIKTOK_DAILY_LIMIT тепер лише ціль для
+# щоденного нагадування ("опубліковано X/N сьогодні"), не жорсткий ліміт.
 TIKTOK_DAILY_LIMIT = int(os.getenv("TIKTOK_DAILY_LIMIT", "3"))
+# TIKTOK_PUBLISH_TIMES тепер використовується лише як список годин-підказок
+# для ручного планування Instagram-каруселі (_build_carousel_schedule_keyboard),
+# не для TikTok.
 TIKTOK_PUBLISH_TIMES = os.getenv("TIKTOK_PUBLISH_TIMES", "09:00,13:00,18:00").split(",")
 VIEWS_THRESHOLD = int(os.getenv("VIEWS_THRESHOLD", "500"))
 INSTAGRAM_PUBLISH_HOUR = int(os.getenv("INSTAGRAM_PUBLISH_HOUR", "10"))

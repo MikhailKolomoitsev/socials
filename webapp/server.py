@@ -24,6 +24,9 @@ from config import (
     INSTAGRAM_CLIENT_ID,
     INSTAGRAM_CLIENT_SECRET,
     INSTAGRAM_REDIRECT_URI,
+    YOUTUBE_CLIENT_ID,
+    YOUTUBE_CLIENT_SECRET,
+    YOUTUBE_REDIRECT_URI,
     ADMIN_SECRET,
     FLASK_SECRET_KEY,
 )
@@ -41,6 +44,9 @@ TIKTOK_SCOPES = "user.info.basic,video.upload,video.list"
 # після додавання нового scope потрібно ПЕРЕПРОЙТИ /auth/instagram/login,
 # стара авторизація без цього permission'у видавання повідомлень не дозволить.
 INSTAGRAM_SCOPES = "instagram_business_basic,instagram_business_content_publish,instagram_business_manage_messages"
+
+# YouTube Data API v3 — лише завантаження відео, без читання/керування каналом.
+YOUTUBE_SCOPES = "https://www.googleapis.com/auth/youtube.upload"
 
 
 @app.route("/")
@@ -234,6 +240,94 @@ def instagram_callback():
         f"ig_user_id: {ig_user_id}<br>"
         "Токен збережено (дійсний 60 днів, оновлюється автоматично) — можеш "
         "закрити цю сторінку.",
+        200,
+    )
+
+
+# ── YouTube Data API v3 (OAuth) ───────────────────────────────────────────────
+# Google OAuth 2.0 authorization code flow, ручний (без google-auth-oauthlib —
+# ті самі 2 HTTP-запити, як і для TikTok/Instagram вище, для узгодженості
+# стилю коду). access_type=offline + prompt=consent — інакше Google віддає
+# refresh_token ЛИШЕ при першій-преший авторизації застосунку акаунтом, а тут
+# треба гарантовано отримати його щоразу (повторний /auth/youtube/login —
+# напр. після відкликання доступу).
+#
+# Google Cloud Console: APIs & Services > Credentials > Create OAuth client ID
+# (Web application) > Authorized redirect URI = YOUTUBE_REDIRECT_URI.
+# OAuth consent screen може лишатись у статусі "Testing" (без верифікації) —
+# просто додай свій Google-акаунт у Test users; при вході Google покаже
+# попередження "Google hasn't verified this app" — тисни
+# "Advanced" > "Go to (app name) (unsafe)", це очікувано для персонального застосунку.
+
+@app.route("/auth/youtube/login")
+def youtube_login():
+    if not ADMIN_SECRET or request.args.get("key") != ADMIN_SECRET:
+        abort(403)
+
+    if not YOUTUBE_CLIENT_ID or not YOUTUBE_REDIRECT_URI:
+        return (
+            "YOUTUBE_CLIENT_ID / YOUTUBE_REDIRECT_URI не задані в змінних середовища.",
+            500,
+        )
+
+    state = secrets.token_urlsafe(16)
+    session["youtube_oauth_state"] = state
+
+    params = {
+        "client_id": YOUTUBE_CLIENT_ID,
+        "redirect_uri": YOUTUBE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": YOUTUBE_SCOPES,
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    return redirect("https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params))
+
+
+@app.route("/auth/youtube/callback")
+def youtube_callback():
+    error = request.args.get("error")
+    if error:
+        return (f"❌ Google відхилив авторизацію: {error}", 400)
+
+    code = request.args.get("code")
+    state = request.args.get("state")
+    if not code or state != session.pop("youtube_oauth_state", None):
+        abort(400, "Невалідний state або відсутній code — почни авторизацію знову.")
+
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": YOUTUBE_CLIENT_ID,
+            "client_secret": YOUTUBE_CLIENT_SECRET,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": YOUTUBE_REDIRECT_URI,
+        },
+        timeout=15,
+    )
+    data = resp.json()
+
+    if "access_token" not in data or "refresh_token" not in data:
+        return (
+            f"❌ Не вдалось отримати токен від Google: {data}<br><br>"
+            "Якщо тут немає refresh_token — можливо, застосунок вже раніше "
+            "авторизовувався цим акаунтом; спробуй відкликати доступ на "
+            "https://myaccount.google.com/permissions і пройти /auth/youtube/login знову.",
+            400,
+        )
+
+    db.save_youtube_tokens(
+        access_token=data["access_token"],
+        refresh_token=data["refresh_token"],
+        expires_in=data.get("expires_in", 3600),
+    )
+
+    return (
+        "✅ YouTube-канал підключено успішно.<br>"
+        "Токен збережено — бот тепер автоматично публікуватиме YouTube Shorts "
+        "після обробки кожного відео. Можеш закрити цю сторінку.",
         200,
     )
 

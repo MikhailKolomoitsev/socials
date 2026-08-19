@@ -56,6 +56,14 @@ INSTAGRAM_CLIENT_ID = os.getenv("INSTAGRAM_CLIENT_ID")
 INSTAGRAM_CLIENT_SECRET = os.getenv("INSTAGRAM_CLIENT_SECRET")
 INSTAGRAM_REDIRECT_URI = os.getenv("INSTAGRAM_REDIRECT_URI")  # напр. https://<railway-domain>/auth/instagram/callback
 
+# YouTube Data API v3 (OAuth) — на відміну від TikTok/Instagram, тут повна
+# автопублікація Shorts одразу після обробки відео (публічно, без App Review —
+# особистий канал), без жодної кнопки. Client ID/Secret з Google Cloud Console
+# (APIs & Services > Credentials > OAuth client ID, тип "Web application").
+YOUTUBE_CLIENT_ID = os.getenv("YOUTUBE_CLIENT_ID")
+YOUTUBE_CLIENT_SECRET = os.getenv("YOUTUBE_CLIENT_SECRET")
+YOUTUBE_REDIRECT_URI = os.getenv("YOUTUBE_REDIRECT_URI")  # напр. https://<railway-domain>/auth/youtube/callback
+
 # Логіка публікацій
 #
 # TikTok більше НЕ публікується автоматично за розкладом — власник сам тисне

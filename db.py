@@ -72,6 +72,14 @@ def init_db():
                 updated_at TEXT DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS youtube_tokens (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                access_token TEXT NOT NULL,
+                refresh_token TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS publish_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 video_id INTEGER,              -- NULL для платформи 'instagram_carousel'
@@ -150,6 +158,12 @@ def _migrate(conn):
     # цитату = перехід до контенту в чаті).
     add_column_if_missing("videos", "chat_id", "chat_id INTEGER")
     add_column_if_missing("videos", "message_id", "message_id INTEGER")
+
+    # YouTube Shorts — публікується повністю автоматично одразу після
+    # обробки (publishers/youtube.py), на відміну від TikTok/Instagram
+    # жодної кнопки немає, тож тут лише факт і час публікації.
+    add_column_if_missing("videos", "youtube_video_id", "youtube_video_id TEXT")
+    add_column_if_missing("videos", "youtube_published_at", "youtube_published_at TEXT")
 
     # publish_queue.video_id був NOT NULL у старій схемі — записи для
     # instagram_carousel мають video_id=NULL (замість цього carousel_id).
@@ -243,6 +257,38 @@ def get_instagram_tokens() -> Optional[dict]:
     return dict(row) if row else None
 
 
+# ── YouTube OAuth tokens ──────────────────────────────────────────────────────
+
+def save_youtube_tokens(access_token: str, refresh_token: str, expires_in: int):
+    """Зберігає (перезаписує) токени YouTube. refresh_token приходить лише
+    ПЕРШОГО разу (Google видає його тільки при access_type=offline+prompt=consent,
+    webapp/server.py:youtube_login) — тому якщо Google не повернув новий при
+    оновленні access_token (publishers/youtube.py:get_valid_access_token),
+    зберігаємо старий, а не NULL (ON CONFLICT SET лишає значення без COALESCE
+    інакше перезаписав би на NULL)."""
+    from datetime import timedelta
+    expires_at = (datetime.now() + timedelta(seconds=expires_in)).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO youtube_tokens (id, access_token, refresh_token, expires_at, updated_at)
+            VALUES (1, ?, ?, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET
+                access_token=excluded.access_token,
+                refresh_token=COALESCE(NULLIF(excluded.refresh_token, ''), youtube_tokens.refresh_token),
+                expires_at=excluded.expires_at,
+                updated_at=datetime('now')
+            """,
+            (access_token, refresh_token or "", expires_at),
+        )
+
+
+def get_youtube_tokens() -> Optional[dict]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM youtube_tokens WHERE id=1").fetchone()
+    return dict(row) if row else None
+
+
 # ── Videos ────────────────────────────────────────────────────────────────────
 
 def create_video(
@@ -293,6 +339,14 @@ def set_instagram_published(video_id: int, media_id: str, caption: str):
         conn.execute(
             "UPDATE videos SET instagram_media_id=?, instagram_published_at=datetime('now'), instagram_caption=? WHERE id=?",
             (media_id, caption, video_id),
+        )
+
+
+def set_youtube_published(video_id: int, youtube_video_id: str):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE videos SET youtube_video_id=?, youtube_published_at=datetime('now') WHERE id=?",
+            (youtube_video_id, video_id),
         )
 
 

@@ -94,19 +94,20 @@ def is_allowed(update: Update) -> bool:
 
 # ── Постійне меню кнопок ─────────────────────────────────────────────────────
 #
-# Замість того, щоб пам'ятати слеш-команди напам'ять — три кнопки завжди на
+# Замість того, щоб пам'ятати слеш-команди напам'ять — кнопки завжди на
 # екрані під полем вводу. Натискання надсилає звичайне текстове повідомлення
 # з міткою кнопки, тому це ловиться MessageHandler(filters.Text([...]))
 # (main(), зареєстрований ПЕРЕД вільним текстовим хендлером каруселі).
 
 BTN_TIKTOK_PENDING = "📋 Неопубліковані тіктоки"
+BTN_TIKTOK_SENT = "✅ Відправлені тіктоки"
 BTN_IG_PENDING = "🎬 Неопубліковані Reels"
 BTN_STATS = "📊 Статистика"
 
 
 def _main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[BTN_TIKTOK_PENDING], [BTN_IG_PENDING], [BTN_STATS]],
+        [[BTN_TIKTOK_PENDING], [BTN_TIKTOK_SENT], [BTN_IG_PENDING], [BTN_STATS]],
         resize_keyboard=True,
     )
 
@@ -137,6 +138,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/dm_blast <текст> — одноразова розсилка в Instagram Direct усім, хто вже писав\n\n"
         f"Кнопки внизу:\n"
         f"{BTN_TIKTOK_PENDING} — оброблені відео, ще не відправлені в TikTok, з кнопкою на кожне\n"
+        f"{BTN_TIKTOK_SENT} — відео, вже відправлені в TikTok, з темою кожного\n"
         f"{BTN_IG_PENDING} — TikTok-відео, ще не опубліковані в Instagram, з переходом до відео в чаті\n"
         f"{BTN_STATS} — перегляди/лайки/коменти TikTok і що варто запостити в Instagram",
         parse_mode="Markdown",
@@ -345,6 +347,45 @@ async def cmd_tiktok_pending(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"📋 Ще не відправлено в TikTok: {len(videos)}.\nОбери яке відправити:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
+
+
+def _video_topic(video: dict) -> str:
+    """Коротка "тема" відео для списків: підпис TikTok, якщо є, інакше
+    перші символи транскрипції (підпис міг не згенеруватись — див.
+    /tiktok_pending, де багато старих відео позначені "без підпису")."""
+    caption = (video.get("tiktok_caption") or "").strip().replace("\n", " ")
+    if caption:
+        return caption
+    transcript = (video.get("transcript") or "").strip().replace("\n", " ")
+    if transcript:
+        return transcript
+    return "без теми"
+
+
+async def cmd_tiktok_sent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Кнопка "Відправлені тіктоки" — відео, вже відправлені в TikTok
+    (tiktok_video_id IS NOT NULL), з темою кожного (підпис або транскрипт)
+    і датою відправки, найновіші першими. Довідково — жодних кнопок дії,
+    самé відео вже пішло в TikTok-inbox (див. /tiktok_pending, якщо потрібно
+    щось саме ВІДПРАВИТИ).
+    """
+    if not is_allowed(update):
+        return
+
+    videos = db.get_sent_tiktok_videos(limit=20)
+    if not videos:
+        await update.message.reply_text("Ще жодного відео не відправлено в TikTok.")
+        return
+
+    lines = [f"✅ Відправлено в TikTok: {len(videos)}.\n"]
+    for v in videos:
+        sent_at = (v.get("tiktok_published_at") or "")[:16]
+        topic = _video_topic(v)[:80]
+        ig_mark = " · 📸 вже в IG" if v.get("instagram_media_id") else ""
+        lines.append(f"🎬 {sent_at} — {topic}{ig_mark}")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1343,6 +1384,7 @@ async def _post_init(app: Application):
         BotCommand("ig_pending", "TikTok-відео, ще не опубліковані в Instagram (з переходом у чат)"),
         BotCommand("publish_ig", "Те саме списком, з реальними переглядами TikTok"),
         BotCommand("tiktok_pending", "Відео, ще не доставлені в TikTok-чернетки"),
+        BotCommand("tiktok_sent", "Відео, вже відправлені в TikTok, з темою кожного"),
         BotCommand("stats", "Перегляди/лайки/коменти TikTok + що варто запостити в Instagram"),
         BotCommand("test_ig", "Перевірка підключення до Instagram (нічого не публікує)"),
         BotCommand("scan_drive", "Перевірити нові відео в Google Drive"),
@@ -1372,6 +1414,7 @@ def main():
     app.add_handler(CommandHandler("publish_ig", cmd_publish_ig))
     app.add_handler(CommandHandler("ig_pending", cmd_ig_pending))
     app.add_handler(CommandHandler("tiktok_pending", cmd_tiktok_pending))
+    app.add_handler(CommandHandler("tiktok_sent", cmd_tiktok_sent))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("test_ig", cmd_test_ig))
     app.add_handler(CommandHandler("dm_blast", cmd_dm_blast))
@@ -1388,6 +1431,7 @@ def main():
     # Постійне меню кнопок — текстові мітки кнопок ловимо ДО вільного тексту
     # каруселі нижче, інакше натискання кнопки сприймалось би за підпис.
     app.add_handler(MessageHandler(filters.Text([BTN_TIKTOK_PENDING]), cmd_tiktok_pending))
+    app.add_handler(MessageHandler(filters.Text([BTN_TIKTOK_SENT]), cmd_tiktok_sent))
     app.add_handler(MessageHandler(filters.Text([BTN_IG_PENDING]), cmd_ig_pending))
     app.add_handler(MessageHandler(filters.Text([BTN_STATS]), cmd_stats))
     # Вільний текст — тільки для підпису каруселі, що очікує на нього (див.

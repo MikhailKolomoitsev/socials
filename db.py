@@ -407,6 +407,19 @@ def get_unpublished_tiktok_videos(limit: int = 15) -> list:
     return [dict(r) for r in rows]
 
 
+def get_sent_tiktok_videos(limit: int = 20) -> list:
+    """Відео, вже відправлені в TikTok (tiktok_video_id IS NOT NULL) —
+    для кнопки "Відправлені тіктоки", найновіші першими."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM videos
+            WHERE tiktok_video_id IS NOT NULL
+            ORDER BY tiktok_published_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ── Carousels (сторітейли) ───────────────────────────────────────────────────
 
 def create_carousel(image_urls: list, caption: str = "") -> int:

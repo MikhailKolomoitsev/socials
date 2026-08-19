@@ -1,24 +1,20 @@
 """
 Telegram бот — точка входу.
 
-Постійне меню кнопок (під полем вводу, з'являється після /start):
-  📋 Неопубліковані тіктоки — /tiktok_pending, оброблені відео ще НЕ
-                              відправлені в TikTok, кнопка на кожне
-  🎬 Неопубліковані Reels  — /ig_pending, TikTok-відео ще не в Instagram
-  📊 Статистика            — /stats, перегляди/лайки/коменти + рекомендації
+Постійне меню кнопок (під полем вводу, з'являється після /start), 2 колонки:
+  📋 Неопубліковані тіктоки  /tiktok_pending  — ще НЕ відправлені в TikTok
+  ✅ Відправлені тіктоки     /tiktok_sent     — вже в TikTok, є "відправити повторно"
+  🎬 Неопубліковані Reels    /ig_pending      — TikTok-відео ще не в Instagram
+  📸 Опубліковані Reels      /ig_sent         — вже в Instagram, є "відправити повторно"
+  📊 Статистика              /stats           — перегляди/лайки/коменти + рекомендації
+  ⚠️ Невдалі відео           /failed_videos   — обробка впала, є "спробувати ще раз"
+Кожен список пагінований (кнопка "▶️ Показати ще", якщо є більше).
 
 Команди:
   /start          — привітання, показує меню кнопок
   /status         — скільки відео опубліковано в TikTok сьогодні (з ліміту TIKTOK_DAILY_LIMIT)
-  /queue          — що в черзі (Instagram Reels / карусель — TikTok у черзі більше немає)
-  /tiktok_pending — оброблені відео, ще НЕ відправлені в TikTok, одним
-                    списком з кнопкою "Відправити в TikTok" на кожне
-  /ig_pending     — TikTok-відео, ще не опубліковані в Instagram, кожне з
-                    переходом до відео в чаті (reply) і кнопкою "Запостити"
-  /publish_ig     — те саме одним списком, з реальними переглядами TikTok
-  /stats          — перегляди/лайки/коменти TikTok (video.list) для
-                    неопублікованих в Instagram відео; топ-3 за переглядами
-                    позначені 🔥 як рекомендовані кандидати на Instagram
+  /queue          — заплановані Instagram-каруселі (TikTok/Reels — повністю ручні, у черзі їх немає)
+  /publish_ig     — те саме, що /ig_pending, одним списком з реальними переглядами TikTok
   /nocap          — опублікувати карусель без підпису (пропустити крок підпису)
 
 Сценарій відео:
@@ -27,20 +23,28 @@ Telegram бот — точка входу.
   3. Відео НЕ відправляється в TikTok автоматично — повідомлення про
      готовність містить кнопку "📤 Відправити в TikTok" (те саме доступно
      пізніше зі списку "📋 Неопубліковані тіктоки"); власник сам вирішує,
-     коли і яке відео відправити
+     коли і яке відео відправити. Той самий publish_tt-хендлер повторно
+     використовується і для "🔁 Відправити повторно" з "✅ Відправлені тіктоки"
   4. Тап кнопки одразу викликає TikTok API (у TikTok-чернетки — публічний
      автопостинг без App Review неможливий) і надсилає в чат нагадування
      "опублікуй" з кнопкою для Instagram Reels
   5. Instagram публікується ЛИШЕ вручну — тапом кнопки "Запостити в
-     Instagram" (з нагадування, /ig_pending, /publish_ig або /stats), ніколи
-     автоматично
+     Instagram" (з нагадування, /ig_pending, /publish_ig, /stats або
+     повторно з "📸 Опубліковані Reels"), ніколи автоматично
   6. Щодня о 13:00 за Києвом (18:00 за Балі) — нагадування, ЯКЩО сьогодні
      опубліковано менше TIKTOK_DAILY_LIMIT тіктоків
+  7. Раз на ~3 дні (якщо є що показати) — нагадування обрати TikTok-відео
+     для Instagram Reels і/або довести до кінця незаплановану карусель
+  8. Якщо пайплайн обробки впав — відео потрапляє у "⚠️ Невдалі відео" з
+     кнопкою "Спробувати ще раз" (повторне завантаження з джерела: Telegram
+     file_id / Google Drive file_id / URL — і той самий пайплайн заново)
 
 Сценарій сторітейл-каруселі (Instagram):
   1. Надсилаєш кілька готових слайдів ОДНИМ альбомом фото (2-10 штук)
   2. Бот вивантажує їх на S3, питає підпис (текстом або /nocap)
   3. Обираєш час публікації — queue_runner.py публікує каруселлю автоматично
+     (єдине, що досі публікується за розкладом, а не кнопкою — свідомо: вибір
+     часу на цьому кроці і Є підтвердженням)
 """
 
 import asyncio
@@ -102,12 +106,24 @@ def is_allowed(update: Update) -> bool:
 BTN_TIKTOK_PENDING = "📋 Неопубліковані тіктоки"
 BTN_TIKTOK_SENT = "✅ Відправлені тіктоки"
 BTN_IG_PENDING = "🎬 Неопубліковані Reels"
+BTN_IG_SENT = "📸 Опубліковані Reels"
 BTN_STATS = "📊 Статистика"
+BTN_FAILED = "⚠️ Невдалі відео"
+
+
+# Розмір сторінки для пагінованих списків (📋/✅/📸/📊/⚠️) — кнопка
+# "▶️ Показати ще" з'являється, лише коли сторінка вийшла повною (евристика:
+# рівно PAGE_SIZE елементів означає, що далі, ймовірно, є ще).
+PAGE_SIZE = 15
 
 
 def _main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[BTN_TIKTOK_PENDING], [BTN_TIKTOK_SENT], [BTN_IG_PENDING], [BTN_STATS]],
+        [
+            [BTN_TIKTOK_PENDING, BTN_TIKTOK_SENT],
+            [BTN_IG_PENDING, BTN_IG_SENT],
+            [BTN_STATS, BTN_FAILED],
+        ],
         resize_keyboard=True,
     )
 
@@ -129,18 +145,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/process_url https://...`\n\n"
         "Надішли кілька фото одним альбомом — запропоную опублікувати їх як "
         "сторітейл-карусель в Instagram.\n\n"
-        "/status — статус сьогоднішніх публікацій\n"
-        "/queue — черга\n"
-        "/ig_pending — список TikTok-відео, ще не опублікованих в Instagram, "
-        "кожне з переходом до відео в чаті й кнопкою «Запостити»\n"
-        "/publish_ig — те саме одним списком з реальними переглядами TikTok\n"
+        "/status — статус сьогоднішніх публікацій в TikTok\n"
+        "/queue — заплановані Instagram-каруселі\n"
         "/test_ig — безпечна перевірка, чи працює публікація в Instagram (нічого не публікує)\n"
         "/dm_blast <текст> — одноразова розсилка в Instagram Direct усім, хто вже писав\n\n"
         f"Кнопки внизу:\n"
         f"{BTN_TIKTOK_PENDING} — оброблені відео, ще не відправлені в TikTok, з кнопкою на кожне\n"
         f"{BTN_TIKTOK_SENT} — відео, вже відправлені в TikTok, з темою кожного і кнопкою «Відправити повторно»\n"
         f"{BTN_IG_PENDING} — TikTok-відео, ще не опубліковані в Instagram, з переходом до відео в чаті\n"
-        f"{BTN_STATS} — перегляди/лайки/коменти TikTok і що варто запостити в Instagram",
+        f"{BTN_IG_SENT} — відео, вже опубліковані в Instagram, з кнопкою «Відправити повторно»\n"
+        f"{BTN_STATS} — перегляди/лайки/коменти TikTok і що варто запостити в Instagram\n"
+        f"{BTN_FAILED} — відео, де обробка впала, з кнопкою «Спробувати ще раз»\n\n"
+        "Раз на ~3 дні також нагадаю обрати відео для Instagram Reels і/або "
+        "доробити незаплановану карусель, якщо є що.",
         parse_mode="Markdown",
         reply_markup=_main_menu_keyboard(),
     )
@@ -156,14 +173,25 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /queue — тепер показує ЛИШЕ заплановані Instagram-каруселі: TikTok і
+    Instagram Reels повністю ручні (кнопки, не publish_queue), тож
+    publish_queue у поточній логіці отримує записи виключно з
+    platform='instagram_carousel' (enqueue_carousel — єдине місце виклику
+    db.enqueue-подібної функції, що лишилось).
+    """
     if not is_allowed(update):
         return
     items = db.get_pending_queue()
     if not items:
-        await update.message.reply_text("Черга порожня.")
+        await update.message.reply_text(
+            "Запланованих Instagram-каруселей немає.\n\n"
+            "(TikTok і Instagram Reels публікуються кнопками, не за розкладом — "
+            "дивись 📋/✅/🎬/📸 в меню.)"
+        )
         return
-    lines = [f"• {i['platform']} о {i['scheduled_at'][:16]}" for i in items]
-    await update.message.reply_text("📅 Черга:\n" + "\n".join(lines))
+    lines = [f"• карусель #{i['carousel_id']} о {i['scheduled_at'][:16]} (UTC)" for i in items]
+    await update.message.reply_text("📅 Заплановані Instagram-каруселі:\n" + "\n".join(lines))
 
 
 async def cmd_publish_ig(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -320,21 +348,16 @@ async def cmd_ig_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 
-async def cmd_tiktok_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Кнопка "Неопубліковані тіктоки" — оброблені відео, які ще НЕ відправлені
-    в TikTok (tiktok_video_id IS NULL). Відправка повністю ручна: кожен рядок
-    списку — кнопка publish_tt:<id>, тап одразу викликає TikTok API
+def _build_tiktok_pending_page(offset: int) -> tuple:
+    """Повертає (text, markup) для сторінки "Неопубліковані тіктоки"
+    (tiktok_video_id IS NULL), offset=0 — перша сторінка. Кожен рядок —
+    кнопка publish_tt:<id>, тап одразу викликає TikTok API
     (handle_publish_tiktok_callback). Ніякого автоматичного розкладу немає —
-    власник сам вирішує, коли і яке відео відправити.
-    """
-    if not is_allowed(update):
-        return
-
-    videos = db.get_unpublished_tiktok_videos(limit=15)
+    власник сам вирішує, коли і яке відео відправити."""
+    videos = db.get_unpublished_tiktok_videos(limit=PAGE_SIZE, offset=offset)
     if not videos:
-        await update.message.reply_text("✅ Усі оброблені відео вже відправлені в TikTok.")
-        return
+        text = "✅ Усі оброблені відео вже відправлені в TikTok." if offset == 0 else "Більше немає."
+        return text, None
 
     buttons = []
     for v in videos:
@@ -342,11 +365,28 @@ async def cmd_tiktok_pending(update: Update, context: ContextTypes.DEFAULT_TYPE)
         created = (v.get("created_at") or "")[:16]
         label = f"{created} · {caption_preview or 'без підпису'}"
         buttons.append([InlineKeyboardButton(label[:64], callback_data=f"publish_tt:{v['id']}")])
+    if len(videos) == PAGE_SIZE:
+        buttons.append([InlineKeyboardButton("▶️ Показати ще", callback_data=f"tp_page:{offset + PAGE_SIZE}")])
 
-    await update.message.reply_text(
-        f"📋 Ще не відправлено в TikTok: {len(videos)}.\nОбери яке відправити:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    count_label = f"(показано з {offset + 1})" if offset else f"{len(videos)}+" if len(videos) == PAGE_SIZE else str(len(videos))
+    return f"📋 Ще не відправлено в TikTok {count_label}.\nОбери яке відправити:", InlineKeyboardMarkup(buttons)
+
+
+async def cmd_tiktok_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    text, markup = _build_tiktok_pending_page(0)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def handle_tiktok_pending_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(update):
+        return
+    offset = int(query.data.split(":", 1)[1])
+    text, markup = _build_tiktok_pending_page(offset)
+    await query.edit_message_text(text, reply_markup=markup)
 
 
 def _video_topic(video: dict) -> str:
@@ -362,56 +402,108 @@ def _video_topic(video: dict) -> str:
     return "без теми"
 
 
-async def cmd_tiktok_sent(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Кнопка "Відправлені тіктоки" — відео, вже відправлені в TikTok
-    (tiktok_video_id IS NOT NULL), з темою кожного (підпис або транскрипт)
-    і датою відправки, найновіші першими. Під списком — кнопка "Відправити
-    повторно" на кожне (publish_tt:<id>, той самий handle_publish_tiktok_callback,
-    що й для першої відправки з /tiktok_pending — див. коментар там про guard
-    "вже відправлено", який для повторної відправки навмисно вимкнено).
-    """
-    if not is_allowed(update):
-        return
-
-    videos = db.get_sent_tiktok_videos(limit=20)
+def _build_tiktok_sent_page(offset: int) -> tuple:
+    """Повертає (text, markup) для сторінки "Відправлені тіктоки"
+    (tiktok_video_id IS NOT NULL), найновіші першими. Кнопка "🔁" на кожне —
+    publish_tt:<id>, той самий handle_publish_tiktok_callback, що й для
+    першої відправки з /tiktok_pending (guard "вже відправлено" там навмисно
+    вимкнено — саме щоб цей resend працював)."""
+    videos = db.get_sent_tiktok_videos(limit=PAGE_SIZE, offset=offset)
     if not videos:
-        await update.message.reply_text("Ще жодного відео не відправлено в TikTok.")
-        return
+        text = "Ще жодного відео не відправлено в TikTok." if offset == 0 else "Більше немає."
+        return text, None
 
-    lines = [f"✅ Відправлено в TikTok: {len(videos)}.\n"]
+    lines = [f"✅ Відправлено в TikTok (з {offset + 1}):\n" if offset else "✅ Відправлено в TikTok:\n"]
     buttons = []
-    for i, v in enumerate(videos, start=1):
+    for i, v in enumerate(videos, start=offset + 1):
         sent_at = (v.get("tiktok_published_at") or "")[:16]
         topic = _video_topic(v)[:80]
         ig_mark = " · 📸 вже в IG" if v.get("instagram_media_id") else ""
         lines.append(f"{i}. 🎬 {sent_at} — {topic}{ig_mark}")
         button_label = f"🔁 {i}. {_video_topic(v)[:40]}"
         buttons.append([InlineKeyboardButton(button_label[:64], callback_data=f"publish_tt:{v['id']}")])
+    if len(videos) == PAGE_SIZE:
+        buttons.append([InlineKeyboardButton("▶️ Показати ще", callback_data=f"ts_page:{offset + PAGE_SIZE}")])
 
-    await update.message.reply_text(
-        "\n".join(lines) + "\n\n🔁 — відправити те саме відео в TikTok ще раз:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    text = "\n".join(lines) + "\n\n🔁 — відправити те саме відео в TikTok ще раз:"
+    return text, InlineKeyboardMarkup(buttons)
 
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Кнопка "Статистика" — реальні перегляди/лайки/коменти TikTok-відео, ще
-    не опублікованих в Instagram, і рекомендація: топ-3 за переглядами
-    позначаються як "залетіло" — кандидати на Instagram Reels.
-    """
+async def cmd_tiktok_sent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
+    text, markup = _build_tiktok_sent_page(0)
+    await update.message.reply_text(text, reply_markup=markup)
 
-    videos = db.get_recent_tiktoks_for_instagram(limit=15)
-    if not videos:
-        await update.message.reply_text(
-            "Немає відео, закинутих у TikTok, які ще не опубліковані в Instagram."
-        )
+
+async def handle_tiktok_sent_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(update):
         return
+    offset = int(query.data.split(":", 1)[1])
+    text, markup = _build_tiktok_sent_page(offset)
+    await query.edit_message_text(text, reply_markup=markup)
 
-    msg = await update.message.reply_text("🔎 Перевіряю реальні перегляди/лайки/коменти в TikTok...")
+
+def _build_ig_sent_page(offset: int) -> tuple:
+    """Повертає (text, markup) для сторінки "Опубліковані Reels"
+    (instagram_media_id IS NOT NULL), найновіші першими. Кнопка "🔁" —
+    publish_ig:<id>, той самий handle_publish_ig_callback (resend = другий
+    пост-дублікат, свідомо — див. коментар там)."""
+    videos = db.get_sent_instagram_videos(limit=PAGE_SIZE, offset=offset)
+    if not videos:
+        text = "Ще жодне відео не опубліковано в Instagram." if offset == 0 else "Більше немає."
+        return text, None
+
+    lines = [f"📸 Опубліковано в Instagram (з {offset + 1}):\n" if offset else "📸 Опубліковано в Instagram:\n"]
+    buttons = []
+    for i, v in enumerate(videos, start=offset + 1):
+        sent_at = (v.get("instagram_published_at") or "")[:16]
+        topic = _video_topic(v)[:80]
+        lines.append(f"{i}. 📸 {sent_at} — {topic}")
+        button_label = f"🔁 {i}. {_video_topic(v)[:40]}"
+        buttons.append([InlineKeyboardButton(button_label[:64], callback_data=f"publish_ig:{v['id']}")])
+    if len(videos) == PAGE_SIZE:
+        buttons.append([InlineKeyboardButton("▶️ Показати ще", callback_data=f"is_page:{offset + PAGE_SIZE}")])
+
+    text = "\n".join(lines) + "\n\n🔁 — опублікувати те саме відео в Instagram ще раз (буде ДРУГИЙ пост):"
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def cmd_ig_sent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    text, markup = _build_ig_sent_page(0)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def handle_ig_sent_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(update):
+        return
+    offset = int(query.data.split(":", 1)[1])
+    text, markup = _build_ig_sent_page(offset)
+    await query.edit_message_text(text, reply_markup=markup)
+
+
+STATS_TOP_N = 3
+
+
+async def _build_stats_page(offset: int) -> tuple:
+    """Повертає (text, markup) для сторінки /stats. 🔥-рекомендація (топ-3 за
+    переглядами) рахується лише в межах ПЕРШОЇ сторінки (offset=0) — це і так
+    лише топ серед останніх PAGE_SIZE кандидатів, не буквально всіх видео за
+    весь час; наступні сторінки просто показують статистику без 🔥, щоб не
+    дублювати "топ-3" ярлик на кожній сторінці."""
+    videos = db.get_recent_tiktoks_for_instagram(limit=PAGE_SIZE, offset=offset)
+    if not videos:
+        text = (
+            "Немає відео, закинутих у TikTok, які ще не опубліковані в Instagram."
+            if offset == 0 else "Більше немає."
+        )
+        return text, None
 
     videos = await asyncio.to_thread(_attach_tiktok_views, videos)
     matched = [v for v in videos if v.get("tiktok_public_views") is not None]
@@ -419,16 +511,16 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     matched.sort(key=lambda v: -(v.get("tiktok_public_views") or 0))
 
     if not matched:
-        await msg.edit_text(
+        text = (
             "Жодне з невиданих в Instagram TikTok-відео ще не зіставлено з "
             "публічним TikTok-акаунтом (усі ще в чернетках або зіставлення не "
             "вдалось). Публікуй у TikTok в застосунку — статистика підтягнеться "
             "після цього."
         )
-        return
+        return text, None
 
-    TOP_N = 3
-    lines = ["📊 Перегляди/лайки/коменти TikTok (не опубліковано в Instagram):\n"]
+    header = "📊 Перегляди/лайки/коменти TikTok (не опубліковано в Instagram):\n"
+    lines = [header if offset == 0 else f"{header.rstrip()} (з {offset + 1}):\n"]
     buttons = []
     for i, v in enumerate(matched):
         caption_preview = (v.get("tiktok_caption") or "").strip().replace("\n", " ")[:40]
@@ -440,7 +532,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stats_str += f" ❤️{_format_views(likes)}"
         if comments is not None:
             stats_str += f" 💬{_format_views(comments)}"
-        recommended = i < TOP_N
+        recommended = offset == 0 and i < STATS_TOP_N
         prefix = "🔥 " if recommended else "• "
         lines.append(f"{prefix}{stats_str} · {caption_preview or 'без підпису'}")
         if recommended:
@@ -449,13 +541,36 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if unmatched:
         lines.append(f"\n❔ Ще {len(unmatched)} відео не зіставлено з публічним TikTok (в чернетках або похибка зіставлення).")
+    if offset == 0:
+        lines.append("\n🔥 — топ-3 за переглядами серед неопублікованих в Instagram. Раджу запостити:")
+    if len(videos) == PAGE_SIZE:
+        buttons.append([InlineKeyboardButton("▶️ Показати ще", callback_data=f"st_page:{offset + PAGE_SIZE}")])
 
-    lines.append("\n🔥 — топ-3 за переглядами серед неопублікованих в Instagram. Раджу запостити:")
+    return "\n".join(lines), InlineKeyboardMarkup(buttons) if buttons else None
 
-    await msg.edit_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
-    )
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Кнопка "Статистика" — реальні перегляди/лайки/коменти TikTok-відео, ще
+    не опублікованих в Instagram, і рекомендація: топ-3 за переглядами
+    позначаються як "залетіло" — кандидати на Instagram Reels.
+    """
+    if not is_allowed(update):
+        return
+    msg = await update.message.reply_text("🔎 Перевіряю реальні перегляди/лайки/коменти в TikTok...")
+    text, markup = await _build_stats_page(0)
+    await msg.edit_text(text, reply_markup=markup)
+
+
+async def handle_stats_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(update):
+        return
+    offset = int(query.data.split(":", 1)[1])
+    await query.edit_message_text("🔎 Перевіряю реальні перегляди/лайки/коменти в TikTok...")
+    text, markup = await _build_stats_page(offset)
+    await query.edit_message_text(text, reply_markup=markup)
 
 
 async def cmd_test_ig(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -492,6 +607,15 @@ async def cmd_test_ig(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_publish_ig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Кнопка "📸 Запостити в Instagram" / "🔁 Відправити повторно"
+    (publish_ig:<video_id>) — теж без guard "вже опубліковано", навмисно:
+    той самий хендлер обслуговує і першу публікацію (з /ig_pending,
+    /publish_ig, /stats, нагадувань), і resend з "📸 Опубліковані Reels"
+    (cmd_ig_sent). На відміну від TikTok-inbox-флоу тут publish_reel —
+    РЕАЛЬНА публікація в стрічку, тож resend створює ДРУГИЙ пост-дублікат —
+    свідомий компроміс на прохання власника, а не помилка.
+    """
     query = update.callback_query
     await query.answer()
 
@@ -503,8 +627,11 @@ async def handle_publish_ig_callback(update: Update, context: ContextTypes.DEFAU
     if not video:
         await query.edit_message_text("❌ Відео не знайдено.")
         return
+    is_resend = bool(video.get("instagram_media_id"))
 
-    await query.edit_message_text("⏳ Публікую в Instagram Reels...")
+    await query.edit_message_text(
+        "⏳ Публікую повторно в Instagram Reels..." if is_resend else "⏳ Публікую в Instagram Reels..."
+    )
 
     insta_caption = adapt_caption_for_instagram(video.get("tiktok_caption", ""))
     # s3_url_instagram — варіант з іншим стилем субтитрів (не TikTok-стиль),
@@ -518,7 +645,8 @@ async def handle_publish_ig_callback(update: Update, context: ContextTypes.DEFAU
             cover_url=video.get("cover_s3_url"),
         )
         db.set_instagram_published(video_id, media_id, insta_caption)
-        await query.edit_message_text(f"✅ Опубліковано в Instagram Reels (media_id={media_id}).")
+        prefix = "✅ ПОВТОРНО опубліковано" if is_resend else "✅ Опубліковано"
+        await query.edit_message_text(f"{prefix} в Instagram Reels (media_id={media_id}).")
     except Exception as e:
         logger.error(f"Помилка публікації в Instagram: {e}", exc_info=True)
         await query.edit_message_text(f"❌ Помилка публікації в Instagram: {e}")
@@ -594,6 +722,102 @@ async def handle_publish_tiktok_callback(update: Update, context: ContextTypes.D
     except Exception as e:
         logger.error(f"Помилка відправки в TikTok: {e}", exc_info=True)
         await query.edit_message_text(f"❌ Помилка відправки в TikTok: {e}")
+
+
+# ── Невдала обробка відео ─────────────────────────────────────────────────────
+
+def _build_failed_videos_page(offset: int) -> tuple:
+    """Повертає (text, markup) для сторінки "Невдалі відео" (failed_videos,
+    resolved=0), найновіші першими. Кнопка "🔁 Спробувати ще раз" —
+    retry_failed:<id> (handle_retry_failed_callback)."""
+    items = db.get_failed_videos(limit=PAGE_SIZE, offset=offset)
+    if not items:
+        text = "✅ Немає відео з невдалою обробкою." if offset == 0 else "Більше немає."
+        return text, None
+
+    lines = [f"⚠️ Невдала обробка (з {offset + 1}):\n" if offset else "⚠️ Невдала обробка:\n"]
+    buttons = []
+    for i, f in enumerate(items, start=offset + 1):
+        failed_at = (f.get("failed_at") or "")[:16]
+        error_preview = (f.get("error") or "").strip().replace("\n", " ")[:100]
+        name = f.get("original_filename") or f["source_ref"]
+        lines.append(f"{i}. ❌ {failed_at} — {name}\n   {error_preview}")
+        label = f"🔁 {i}. {name}"
+        buttons.append([InlineKeyboardButton(label[:64], callback_data=f"retry_failed:{f['id']}")])
+    if len(items) == PAGE_SIZE:
+        buttons.append([InlineKeyboardButton("▶️ Показати ще", callback_data=f"fv_page:{offset + PAGE_SIZE}")])
+
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def cmd_failed_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    text, markup = _build_failed_videos_page(0)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def handle_failed_videos_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(update):
+        return
+    offset = int(query.data.split(":", 1)[1])
+    text, markup = _build_failed_videos_page(offset)
+    await query.edit_message_text(text, reply_markup=markup)
+
+
+async def handle_retry_failed_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Кнопка "🔁 Спробувати ще раз" (retry_failed:<failed_id>) — перезавантажує
+    файл із джерела (telegram file_id / drive file_id / url — джерело
+    зберігається в failed_videos.source_type/source_ref, бо локальний файл
+    на момент провалу вже видалений у finally) і заново запускає пайплайн
+    через _process_drive_file (Update-агностична — працює й тут, і для
+    Drive-поллера).
+
+    Рядок resolved одразу (оптимістично, ДО повторної спроби): якщо retry
+    знову впаде — except у _process_drive_file створить НОВИЙ запис
+    failed_videos зі свіжою помилкою, замість накопичення дублів на
+    той самий відеофайл.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    if not is_allowed(update):
+        return
+
+    failed_id = int(query.data.split(":", 1)[1])
+    fv = db.get_failed_video_by_id(failed_id)
+    if not fv:
+        await query.edit_message_text("❌ Запис не знайдено (можливо, вже прибрано).")
+        return
+
+    db.resolve_failed_video(failed_id)
+    await query.edit_message_text(f"🔁 Повторно завантажую «{fv['original_filename']}»...")
+    chat_id = fv.get("chat_id") or TELEGRAM_ALLOWED_USER_ID
+
+    try:
+        if fv["source_type"] == "telegram":
+            file = await context.bot.get_file(fv["source_ref"])
+            local_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_retry.mp4")
+            await file.download_to_drive(local_path)
+        elif fv["source_type"] == "drive":
+            local_path = await asyncio.to_thread(drive_download, fv["source_ref"], fv["original_filename"])
+        elif fv["source_type"] == "url":
+            local_path = await asyncio.to_thread(_download_direct_url, fv["source_ref"])
+        else:
+            raise RuntimeError(f"Невідоме джерело: {fv['source_type']}")
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Не вдалось повторно завантажити: {e}")
+        db.log_failed_video(fv["original_filename"], fv["source_type"], fv["source_ref"], str(e), chat_id=chat_id)
+        return
+
+    retry_msg = await context.bot.send_message(chat_id=chat_id, text="⏳ Обробляю повторно...")
+    await _process_drive_file(
+        context.application, chat_id, retry_msg, local_path, fv["original_filename"],
+        source_type=fv["source_type"], source_ref=fv["source_ref"],
+    )
 
 
 # ── Instagram Direct: одноразова розсилка ────────────────────────────────────
@@ -932,21 +1156,29 @@ async def cmd_process_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.edit_text("❌ Не вдалось витягти ID файлу з посилання Google Drive.")
                 return
             local_path = await asyncio.to_thread(drive_download, file_id, "video.mp4")
+            source_type, source_ref = "drive", file_id
         else:
-            # Пряме посилання
-            local_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_raw.mp4")
-            resp = await asyncio.to_thread(
-                lambda: http_requests.get(url, stream=True, timeout=120)
-            )
-            resp.raise_for_status()
-            with open(local_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
+            local_path = await asyncio.to_thread(_download_direct_url, url)
+            source_type, source_ref = "url", url
     except Exception as e:
         await msg.edit_text(f"❌ Не вдалось завантажити відео: {e}")
         return
 
-    await _process_video_file(update, context, msg, local_path)
+    await _process_video_file(update, context, msg, local_path, source_type=source_type, source_ref=source_ref)
+
+
+def _download_direct_url(url: str) -> str:
+    """Синхронне завантаження прямого посилання на mp4 (виконується через
+    asyncio.to_thread). Винесено з cmd_process_url окремою функцією, щоб те
+    саме завантаження можна було повторити з "⚠️ Невдалі відео" →
+    "🔁 Спробувати ще раз" (handle_retry_failed_callback)."""
+    local_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_raw.mp4")
+    resp = http_requests.get(url, stream=True, timeout=120)
+    resp.raise_for_status()
+    with open(local_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+    return local_path
 
 
 async def cmd_scan_drive(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1043,7 +1275,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     original_name = getattr(video, "file_name", None) or "video.mp4"
-    await _process_video_file(update, context, msg, local_path, original_name)
+    await _process_video_file(
+        update, context, msg, local_path, original_name,
+        source_type="telegram", source_ref=video.file_id,
+    )
 
 
 async def _process_video_file(
@@ -1052,8 +1287,16 @@ async def _process_video_file(
     msg,
     local_path: str,
     original_name: str = "video.mp4",
+    source_type: str = "telegram",
+    source_ref: str = "",
 ):
-    """Спільний пайплайн обробки відео для handle_video і cmd_process_url."""
+    """Спільний пайплайн обробки відео для handle_video і cmd_process_url.
+
+    source_type/source_ref — звідки взяти файл ЗАНОВО, якщо обробка впаде
+    (telegram file_id / drive file_id / url) — записується в failed_videos
+    (див. except нижче), щоб "⚠️ Невдалі відео" → "🔁 Спробувати ще раз"
+    (handle_retry_failed_callback) міг перезавантажити той самий файл
+    (локальний local_path на той момент уже видалено в finally)."""
     std_path = None
     no_silence_path = None
     vertical_path = None
@@ -1167,7 +1410,18 @@ async def _process_video_file(
 
     except Exception as e:
         logger.error(f"Pipeline error: {e}", exc_info=True)
-        await msg.edit_text(f"❌ Помилка обробки: {e}")
+        if source_ref:
+            db.log_failed_video(
+                original_name, source_type, source_ref, str(e),
+                chat_id=update.effective_chat.id,
+                message_id=getattr(msg, "message_id", None),
+            )
+            await msg.edit_text(
+                f"❌ Помилка обробки: {e}\n\n"
+                f"Додав у {BTN_FAILED} — можна спробувати ще раз кнопкою."
+            )
+        else:
+            await msg.edit_text(f"❌ Помилка обробки: {e}")
     finally:
         cleanup_paths = [local_path, no_silence_path, vertical_path, *ass_paths, *final_video_paths.values(), frame_path, cover_path]
         for path in cleanup_paths:
@@ -1236,6 +1490,48 @@ async def _daily_tiktok_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ── Періодичне нагадування "обери контент для Instagram" ─────────────────────
+#
+# Раз на ~3 дні (не за job_queue-розкладом — той губиться при кожному
+# редеплої — а за станом у БД, db.get_last_reminder_at, щоб каданс пережив
+# рестарт), і ЛИШЕ якщо є що показати: неопубліковані в Instagram TikTok-
+# відео і/або каруселі, доведені до половини (створені, але без підпису/часу
+# публікації). Перевіряється щодня о 12:00 Києва (окремо від 13:00 TikTok-
+# нагадування, щоб не приходили обидва одночасно).
+
+IG_REMINDER_HOUR_KYIV = 12
+IG_REMINDER_MINUTE_KYIV = 0
+IG_REMINDER_MIN_DAYS = 3
+IG_REMINDER_KIND = "ig_choose_reel"
+
+
+async def _ig_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    last_sent = db.get_last_reminder_at(IG_REMINDER_KIND)
+    if last_sent and (datetime.now() - last_sent) < timedelta(days=IG_REMINDER_MIN_DAYS):
+        return
+
+    pending_reels = db.count_pending_instagram_reels()
+    unscheduled_carousels = db.get_unscheduled_carousels(limit=5)
+    if not pending_reels and not unscheduled_carousels:
+        return  # нема чого нагадувати — не логуємо відправку, спробуємо знову завтра
+
+    lines = ["🔔 Нагадування (раз на кілька днів):\n"]
+    if pending_reels:
+        lines.append(f"🎬 {pending_reels} TikTok-відео ще не в Instagram Reels — обери одне в «{BTN_IG_PENDING}».")
+    if unscheduled_carousels:
+        lines.append(
+            f"📚 {len(unscheduled_carousels)} карусель(і) створено, але не доведено до кінця "
+            "(без підпису/часу публікації) — доверши через /nocap або підпис текстом."
+        )
+
+    await context.bot.send_message(
+        chat_id=TELEGRAM_ALLOWED_USER_ID,
+        text="\n".join(lines),
+        reply_markup=_main_menu_keyboard(),
+    )
+    db.log_reminder_sent(IG_REMINDER_KIND)
+
+
 # ── Google Drive auto-poller ──────────────────────────────────────────────────
 
 DRIVE_POLL_INTERVAL = 120  # секунди між перевірками папки
@@ -1289,11 +1585,20 @@ async def _drive_poll_job(context: ContextTypes.DEFAULT_TYPE):
         await _process_drive_file(context.application, chat_id, msg, local_path, filename, file_id)
 
 
-async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename: str, file_id: str = ""):
+async def _process_drive_file(
+    app, chat_id: int, msg, local_path: str, filename: str, file_id: str = "",
+    source_type: str = "drive", source_ref: str = None,
+):
     """
-    Запускає пайплайн обробки для файлу з Drive без реального telegram.Update.
-    Надсилає результати напряму в chat_id.
-    """
+    Запускає пайплайн обробки для файлу з Drive (або будь-якого джерела —
+    Update-агностична, тому й handle_retry_failed_callback перевикористовує
+    її для повторної обробки telegram-/url-джерел теж) без реального
+    telegram.Update. Надсилає результати напряму в chat_id.
+
+    source_type/source_ref — як і в _process_video_file, для запису в
+    failed_videos при провалі (за замовчуванням "drive"/file_id — типовий
+    виклик з Drive-поллера/кнопки)."""
+    source_ref = source_ref if source_ref is not None else file_id
     std_path = no_silence_path = vertical_path = None
     ass_paths = []
     final_video_paths = {}
@@ -1384,7 +1689,17 @@ async def _process_drive_file(app, chat_id: int, msg, local_path: str, filename:
 
     except Exception as e:
         logger.error(f"Drive pipeline error: {e}", exc_info=True)
-        await msg.edit_text(f"❌ Помилка обробки «{filename}»: {e}")
+        if source_ref:
+            db.log_failed_video(
+                filename, source_type, source_ref, str(e),
+                chat_id=chat_id, message_id=getattr(msg, "message_id", None),
+            )
+            await msg.edit_text(
+                f"❌ Помилка обробки «{filename}»: {e}\n\n"
+                f"Додав у {BTN_FAILED} — можна спробувати ще раз кнопкою."
+            )
+        else:
+            await msg.edit_text(f"❌ Помилка обробки «{filename}»: {e}")
     finally:
         unmark_processing(file_id)
         cleanup_paths = [local_path, std_path, no_silence_path, vertical_path, *ass_paths, *final_video_paths.values(), frame_path, cover_path]
@@ -1408,12 +1723,14 @@ async def _post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Довідка — як користуватись ботом"),
         BotCommand("status", "Скільки опубліковано в TikTok сьогодні"),
-        BotCommand("queue", "Черга запланованих публікацій"),
+        BotCommand("queue", "Заплановані Instagram-каруселі"),
+        BotCommand("tiktok_pending", "Оброблені відео, ще не відправлені в TikTok"),
+        BotCommand("tiktok_sent", "Відео, вже відправлені в TikTok (є «відправити повторно»)"),
         BotCommand("ig_pending", "TikTok-відео, ще не опубліковані в Instagram (з переходом у чат)"),
-        BotCommand("publish_ig", "Те саме списком, з реальними переглядами TikTok"),
-        BotCommand("tiktok_pending", "Відео, ще не доставлені в TikTok-чернетки"),
-        BotCommand("tiktok_sent", "Відео, вже відправлені в TikTok, з темою кожного"),
+        BotCommand("ig_sent", "Відео, вже опубліковані в Instagram (є «відправити повторно»)"),
+        BotCommand("publish_ig", "Те саме, що ig_pending, одним списком з реальними переглядами TikTok"),
         BotCommand("stats", "Перегляди/лайки/коменти TikTok + що варто запостити в Instagram"),
+        BotCommand("failed_videos", "Відео, де обробка впала (є «спробувати ще раз»)"),
         BotCommand("test_ig", "Перевірка підключення до Instagram (нічого не публікує)"),
         BotCommand("scan_drive", "Перевірити нові відео в Google Drive"),
         BotCommand("process_url", "Обробити відео за посиланням (якщо файл >20MB)"),
@@ -1441,9 +1758,11 @@ def main():
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("publish_ig", cmd_publish_ig))
     app.add_handler(CommandHandler("ig_pending", cmd_ig_pending))
+    app.add_handler(CommandHandler("ig_sent", cmd_ig_sent))
     app.add_handler(CommandHandler("tiktok_pending", cmd_tiktok_pending))
     app.add_handler(CommandHandler("tiktok_sent", cmd_tiktok_sent))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("failed_videos", cmd_failed_videos))
     app.add_handler(CommandHandler("test_ig", cmd_test_ig))
     app.add_handler(CommandHandler("dm_blast", cmd_dm_blast))
     app.add_handler(CommandHandler("process_url", cmd_process_url))
@@ -1452,6 +1771,12 @@ def main():
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(CallbackQueryHandler(handle_publish_ig_callback, pattern=r"^publish_ig:"))
     app.add_handler(CallbackQueryHandler(handle_publish_tiktok_callback, pattern=r"^publish_tt:"))
+    app.add_handler(CallbackQueryHandler(handle_retry_failed_callback, pattern=r"^retry_failed:"))
+    app.add_handler(CallbackQueryHandler(handle_tiktok_pending_page_callback, pattern=r"^tp_page:"))
+    app.add_handler(CallbackQueryHandler(handle_tiktok_sent_page_callback, pattern=r"^ts_page:"))
+    app.add_handler(CallbackQueryHandler(handle_ig_sent_page_callback, pattern=r"^is_page:"))
+    app.add_handler(CallbackQueryHandler(handle_stats_page_callback, pattern=r"^st_page:"))
+    app.add_handler(CallbackQueryHandler(handle_failed_videos_page_callback, pattern=r"^fv_page:"))
     app.add_handler(CallbackQueryHandler(handle_dm_blast_callback, pattern=r"^dm_blast_(confirm|cancel)$"))
     app.add_handler(CommandHandler("nocap", cmd_nocap))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_carousel_photos))
@@ -1461,7 +1786,9 @@ def main():
     app.add_handler(MessageHandler(filters.Text([BTN_TIKTOK_PENDING]), cmd_tiktok_pending))
     app.add_handler(MessageHandler(filters.Text([BTN_TIKTOK_SENT]), cmd_tiktok_sent))
     app.add_handler(MessageHandler(filters.Text([BTN_IG_PENDING]), cmd_ig_pending))
+    app.add_handler(MessageHandler(filters.Text([BTN_IG_SENT]), cmd_ig_sent))
     app.add_handler(MessageHandler(filters.Text([BTN_STATS]), cmd_stats))
+    app.add_handler(MessageHandler(filters.Text([BTN_FAILED]), cmd_failed_videos))
     # Вільний текст — тільки для підпису каруселі, що очікує на нього (див.
     # handle_carousel_caption_text: якщо очікування немає — нічого не робить).
     # Реєструємо останнім, щоб не заважати командам вище.
@@ -1485,6 +1812,19 @@ def main():
     )
     logger.info(
         f"Щоденне нагадування: {DAILY_REMINDER_HOUR_KYIV:02d}:{DAILY_REMINDER_MINUTE_KYIV:02d} за Києвом."
+    )
+
+    # Нагадування "обери контент для Instagram" — раз на ~3 дні (перевірка
+    # щодня о 12:00 Києва, сам job вирішує чи вже минуло 3 дні й чи є що
+    # показати — див. _ig_reminder_job).
+    app.job_queue.run_daily(
+        _ig_reminder_job,
+        time=dt_time(hour=IG_REMINDER_HOUR_KYIV, minute=IG_REMINDER_MINUTE_KYIV, tzinfo=_KYIV_TZ),
+        name="ig_reminder",
+    )
+    logger.info(
+        f"Instagram-нагадування: перевірка о {IG_REMINDER_HOUR_KYIV:02d}:{IG_REMINDER_MINUTE_KYIV:02d} "
+        f"за Києвом, надсилається не частіше ніж раз на {IG_REMINDER_MIN_DAYS} дні."
     )
 
     logger.info("Бот запущено. Очікую відео...")

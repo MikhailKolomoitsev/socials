@@ -91,6 +91,24 @@ def init_db():
                 error TEXT,
                 sent_at TEXT DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS reminder_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,            -- напр. 'ig_choose_reel'
+                sent_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS failed_videos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                original_filename TEXT,
+                source_type TEXT NOT NULL,     -- 'telegram' / 'drive' / 'url'
+                source_ref TEXT NOT NULL,      -- file_id (telegram/drive) або URL
+                error TEXT,
+                chat_id INTEGER,
+                message_id INTEGER,
+                failed_at TEXT DEFAULT (datetime('now')),
+                resolved INTEGER DEFAULT 0     -- 1 після успішного повторного запуску
+            );
         """)
         _migrate(conn)
 
@@ -305,7 +323,7 @@ def get_yesterdays_tiktoks():
     return [dict(r) for r in rows]
 
 
-def get_recent_tiktoks_for_instagram(limit: int = 10):
+def get_recent_tiktoks_for_instagram(limit: int = 10, offset: int = 0):
     """Останні відео, закинуті в TikTok (inbox) і ще не опубліковані в Instagram.
 
     Використовується Telegram-командою "опублікувати в Instagram": власник сам
@@ -322,9 +340,20 @@ def get_recent_tiktoks_for_instagram(limit: int = 10):
             WHERE tiktok_video_id IS NOT NULL
               AND instagram_media_id IS NULL
             ORDER BY (tiktok_public_views IS NULL) ASC, tiktok_public_views DESC, tiktok_published_at DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
     return [dict(r) for r in rows]
+
+
+def count_pending_instagram_reels() -> int:
+    """Скільки TikTok-відео ще НЕ опубліковано в Instagram — для періодичного
+    нагадування "обери рілс" (main.py:_ig_reminder_job)."""
+    with get_conn() as conn:
+        row = conn.execute("""
+            SELECT COUNT(*) as cnt FROM videos
+            WHERE tiktok_video_id IS NOT NULL AND instagram_media_id IS NULL
+        """).fetchone()
+    return row["cnt"]
 
 
 def match_tiktok_public_video(
@@ -392,7 +421,7 @@ def get_pending_queue():
     return [dict(r) for r in rows]
 
 
-def get_unpublished_tiktok_videos(limit: int = 15) -> list:
+def get_unpublished_tiktok_videos(limit: int = 15, offset: int = 0) -> list:
     """Оброблені відео, ще НЕ відправлені в TikTok (tiktok_video_id IS NULL) —
     для кнопки "Неопубліковані тіктоки". Відправка повністю ручна (кнопка
     publish_tt:<id>, main.py:handle_publish_tiktok_callback) — жодного
@@ -402,12 +431,12 @@ def get_unpublished_tiktok_videos(limit: int = 15) -> list:
             SELECT * FROM videos
             WHERE tiktok_video_id IS NULL
             ORDER BY created_at ASC
-            LIMIT ?
-        """, (limit,)).fetchall()
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
     return [dict(r) for r in rows]
 
 
-def get_sent_tiktok_videos(limit: int = 20) -> list:
+def get_sent_tiktok_videos(limit: int = 20, offset: int = 0) -> list:
     """Відео, вже відправлені в TikTok (tiktok_video_id IS NOT NULL) —
     для кнопки "Відправлені тіктоки", найновіші першими."""
     with get_conn() as conn:
@@ -415,8 +444,24 @@ def get_sent_tiktok_videos(limit: int = 20) -> list:
             SELECT * FROM videos
             WHERE tiktok_video_id IS NOT NULL
             ORDER BY tiktok_published_at DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_sent_instagram_videos(limit: int = 20, offset: int = 0) -> list:
+    """Відео, вже опубліковані в Instagram Reels (instagram_media_id IS NOT
+    NULL) — для кнопки "Опубліковані Reels" з кнопкою "Відправити повторно"
+    (повторна публікація створить ДРУГИЙ пост в Instagram — не чернетка, як
+    у TikTok, а реальна публікація; додано на прохання власника попри цей
+    ризик дублю)."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM videos
+            WHERE instagram_media_id IS NOT NULL
+            ORDER BY instagram_published_at DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -500,3 +545,88 @@ def count_tiktoks_today() -> int:
             WHERE date(tiktok_published_at) = date('now')
         """).fetchone()
     return row["cnt"]
+
+
+# ── Періодичні нагадування (стан для "раз на N днів") ────────────────────────
+
+def get_last_reminder_at(kind: str) -> Optional[datetime]:
+    """Коли востаннє РЕАЛЬНО надсилалось нагадування цього типу (не щоразу,
+    коли job перевіряв умову — лише коли повідомлення дійсно пішло). Стан у
+    БД, а не в job_queue-розкладі, щоб пережити редеплой без збою кадансу
+    (main.py:_ig_reminder_job)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT sent_at FROM reminder_log WHERE kind=? ORDER BY sent_at DESC LIMIT 1",
+            (kind,),
+        ).fetchone()
+    if not row:
+        return None
+    return datetime.fromisoformat(row["sent_at"].replace(" ", "T"))
+
+
+def log_reminder_sent(kind: str):
+    with get_conn() as conn:
+        conn.execute("INSERT INTO reminder_log (kind) VALUES (?)", (kind,))
+
+
+# ── Каруселі, "загублені" на півдорозі ───────────────────────────────────────
+
+def get_unscheduled_carousels(limit: int = 10) -> list:
+    """Каруселі, створені (create_carousel — слайди вже на S3), але так і НЕ
+    доведені до кінця: без публікації і без активного запису в publish_queue
+    (власник не дообрав підпис/час, або той запис впав). Для періодичного
+    Instagram-нагадування (main.py:_ig_reminder_job)."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT c.* FROM carousels c
+            WHERE c.instagram_media_id IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM publish_queue q
+                WHERE q.carousel_id = c.id AND q.status = 'pending'
+              )
+            ORDER BY c.created_at ASC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Невдала обробка відео ────────────────────────────────────────────────────
+
+def log_failed_video(
+    original_filename: str, source_type: str, source_ref: str, error: str,
+    chat_id: int = None, message_id: int = None,
+) -> int:
+    """Фіксує провал пайплайну обробки (main.py:_process_video_file /
+    _process_drive_file, except-гілка) разом з достатньою інформацією, щоб
+    повторно завантажити той самий файл (source_type/source_ref) для кнопки
+    "Спробувати ще раз" (handle_retry_failed_callback)."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO failed_videos
+               (original_filename, source_type, source_ref, error, chat_id, message_id)
+               VALUES (?,?,?,?,?,?)""",
+            (original_filename, source_type, source_ref, str(error)[:500], chat_id, message_id),
+        )
+        return cur.lastrowid
+
+
+def get_failed_videos(limit: int = 15, offset: int = 0) -> list:
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM failed_videos
+            WHERE resolved = 0
+            ORDER BY failed_at DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_failed_video_by_id(failed_id: int) -> Optional[dict]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM failed_videos WHERE id=?", (failed_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def resolve_failed_video(failed_id: int):
+    with get_conn() as conn:
+        conn.execute("UPDATE failed_videos SET resolved=1 WHERE id=?", (failed_id,))

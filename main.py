@@ -138,7 +138,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/dm_blast <текст> — одноразова розсилка в Instagram Direct усім, хто вже писав\n\n"
         f"Кнопки внизу:\n"
         f"{BTN_TIKTOK_PENDING} — оброблені відео, ще не відправлені в TikTok, з кнопкою на кожне\n"
-        f"{BTN_TIKTOK_SENT} — відео, вже відправлені в TikTok, з темою кожного\n"
+        f"{BTN_TIKTOK_SENT} — відео, вже відправлені в TikTok, з темою кожного і кнопкою «Відправити повторно»\n"
         f"{BTN_IG_PENDING} — TikTok-відео, ще не опубліковані в Instagram, з переходом до відео в чаті\n"
         f"{BTN_STATS} — перегляди/лайки/коменти TikTok і що варто запостити в Instagram",
         parse_mode="Markdown",
@@ -366,9 +366,10 @@ async def cmd_tiktok_sent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Кнопка "Відправлені тіктоки" — відео, вже відправлені в TikTok
     (tiktok_video_id IS NOT NULL), з темою кожного (підпис або транскрипт)
-    і датою відправки, найновіші першими. Довідково — жодних кнопок дії,
-    самé відео вже пішло в TikTok-inbox (див. /tiktok_pending, якщо потрібно
-    щось саме ВІДПРАВИТИ).
+    і датою відправки, найновіші першими. Під списком — кнопка "Відправити
+    повторно" на кожне (publish_tt:<id>, той самий handle_publish_tiktok_callback,
+    що й для першої відправки з /tiktok_pending — див. коментар там про guard
+    "вже відправлено", який для повторної відправки навмисно вимкнено).
     """
     if not is_allowed(update):
         return
@@ -379,13 +380,19 @@ async def cmd_tiktok_sent(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = [f"✅ Відправлено в TikTok: {len(videos)}.\n"]
-    for v in videos:
+    buttons = []
+    for i, v in enumerate(videos, start=1):
         sent_at = (v.get("tiktok_published_at") or "")[:16]
         topic = _video_topic(v)[:80]
         ig_mark = " · 📸 вже в IG" if v.get("instagram_media_id") else ""
-        lines.append(f"🎬 {sent_at} — {topic}{ig_mark}")
+        lines.append(f"{i}. 🎬 {sent_at} — {topic}{ig_mark}")
+        button_label = f"🔁 {i}. {_video_topic(v)[:40]}"
+        buttons.append([InlineKeyboardButton(button_label[:64], callback_data=f"publish_tt:{v['id']}")])
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(
+        "\n".join(lines) + "\n\n🔁 — відправити те саме відео в TikTok ще раз:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -519,8 +526,14 @@ async def handle_publish_ig_callback(update: Update, context: ContextTypes.DEFAU
 
 async def handle_publish_tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Кнопка "📤 Відправити в TikTok" (publish_tt:<video_id>) — ручний тригер,
-    єдиний спосіб потрапити в TikTok тепер (жодного автоматичного розкладу).
+    Кнопка "📤 Відправити в TikTok" / "🔁 Відправити повторно"
+    (publish_tt:<video_id>) — ручний тригер, єдиний спосіб потрапити в
+    TikTok тепер (жодного автоматичного розкладу). Той самий хендлер і для
+    першої відправки (з /tiktok_pending), і для повторної (з /tiktok_sent,
+    tiktok_video_id вже заповнений) — навмисно без guard "вже відправлено":
+    повторна відправка це нове завантаження в inbox, TikTok не заперечує
+    проти дублікатів, і set_tiktok_published просто перезапише
+    tiktok_video_id/tiktok_published_at на щойно відправлене.
 
     Викликає TikTok API напряму (publishers.tiktok.publish_video), що
     закидає відео у TikTok-inbox (чернетки) — власник однаково має сам
@@ -540,11 +553,13 @@ async def handle_publish_tiktok_callback(update: Update, context: ContextTypes.D
     if not video:
         await query.edit_message_text("❌ Відео не знайдено.")
         return
-    if video.get("tiktok_video_id"):
-        await query.edit_message_text("✅ Це відео вже відправлено в TikTok.")
-        return
+    is_resend = bool(video.get("tiktok_video_id"))
 
-    await query.edit_message_text("⏳ Відправляю в TikTok (може зайняти кілька хвилин)...")
+    await query.edit_message_text(
+        "⏳ Відправляю повторно в TikTok (може зайняти кілька хвилин)..."
+        if is_resend else
+        "⏳ Відправляю в TikTok (може зайняти кілька хвилин)..."
+    )
 
     caption = video.get("tiktok_caption") or ""
     try:
@@ -555,8 +570,9 @@ async def handle_publish_tiktok_callback(update: Update, context: ContextTypes.D
             cover_image_url=video.get("cover_s3_url"),
         )
         db.set_tiktok_published(video_id, tiktok_video_id, caption)
+        intro = "🎬 Відео ПОВТОРНО завантажилось у TikTok-чернетки!" if is_resend else "🎬 Відео завантажилось у TikTok-чернетки!"
         await query.edit_message_text(
-            "🎬 Відео завантажилось у TikTok-чернетки!\n\n"
+            f"{intro}\n\n"
             "Відкрий TikTok і натисни «Опублікувати».\n\n"
             "Коли будеш готовий — можна одразу закинути це відео в Instagram Reels:",
             reply_markup=InlineKeyboardMarkup([[

@@ -579,6 +579,18 @@ async def handle_publish_tiktok_callback(update: Update, context: ContextTypes.D
                 InlineKeyboardButton("📸 Запостити в Instagram", callback_data=f"publish_ig:{video_id}")
             ]]),
         )
+        # При повторній відправці обкладинку й підпис НЕ шлемо наново (щоб не
+        # смітити в чаті) — замість цього коротке reply-посилання на
+        # оригінальне повідомлення з відео, під яким вони вже лежать.
+        if is_resend and video.get("chat_id") and video.get("message_id"):
+            try:
+                await context.bot.send_message(
+                    chat_id=video["chat_id"],
+                    text="📋 Обкладинка і підпис — дивись повідомлення під оригінальним відео вище ⬆️",
+                    reply_to_message_id=video["message_id"],
+                )
+            except TgBadRequest:
+                pass  # оригінальне повідомлення видалене/недоступне — пропускаємо
     except Exception as e:
         logger.error(f"Помилка відправки в TikTok: {e}", exc_info=True)
         await query.edit_message_text(f"❌ Помилка відправки в TikTok: {e}")

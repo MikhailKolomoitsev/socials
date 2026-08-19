@@ -21,6 +21,7 @@ import io
 import json
 import logging
 import os
+import random
 import uuid
 
 import requests as http_requests
@@ -38,19 +39,56 @@ COVER_WIDTH  = 1080
 COVER_HEIGHT = 1920
 
 # ── DALL-E стиль блогу ────────────────────────────────────────────────────────
-# Орієнтований на той самий стиль що на скріншотах:
-# темний фон, один сильний атмосферний об'єкт, cinematic lighting.
-# Перевизначається через env COVER_STYLE_SUFFIX.
-_DEFAULT_STYLE = (
-    "ultra dark background (almost black with deep teal or indigo hints), "
-    "one powerful central subject — could be a glowing silhouette, "
-    "abstract geometric shape, glowing particle effect, cosmic element, "
-    "or nature metaphor relevant to the topic. "
+# Спільна база (бренд-впізнаваність: темно, кінематографічно, без тексту/облич,
+# 9:16 — інакше логотип і hook-текст зверху/знизу не будуть читабельні) +
+# один із варіантів кольору/настрою, обраний ВИПАДКОВО щоразу (_pick_style),
+# щоб обкладинки не зливались в одну й ту саму темно-бірюзову картинку.
+# COVER_STYLE_SUFFIX (env) — явний override: якщо задано, рандомізація
+# вимикається і завжди йде саме цей стиль (як і раніше).
+_BASE_STYLE = (
     "Cinematic volumetric lighting, high contrast, photorealistic digital art. "
     "No text, no watermarks, no faces, no readable words. "
     "Aspect ratio 9:16 portrait."
 )
-COVER_STYLE_SUFFIX = os.getenv("COVER_STYLE_SUFFIX", _DEFAULT_STYLE)
+
+_STYLE_VARIANTS = [
+    "ultra dark background (almost black with deep teal or indigo hints), "
+    "one powerful central subject — a glowing silhouette or abstract geometric shape.",
+
+    "ultra dark background (near-black with deep crimson or burgundy undertones), "
+    "one dramatic central subject bathed in a single warm red rim light.",
+
+    "ultra dark background (charcoal black with cold cyan-blue accent light), "
+    "a stark architectural or geometric structure fading into shadow.",
+
+    "ultra dark background (black with warm amber and bronze glow), "
+    "a single object wreathed in drifting smoke or embers.",
+
+    "ultra dark background (deep violet-black with faint magenta haze), "
+    "a surreal, dreamlike shape suspended in empty space.",
+
+    "near-black monochrome background with ONE sharp accent color streak "
+    "(electric green, gold, or icy blue), minimalist and stark.",
+
+    "ultra dark background (almost black with subtle emerald-teal fog), "
+    "rippling water or fractured glass catching a single light source.",
+
+    "ultra dark background (deep indigo-black), a lone human silhouette from "
+    "behind or in profile, never facing camera, backlit by a distant glow.",
+
+    "ultra dark background (black with cold steel-blue moonlight), "
+    "storm clouds, lightning, or wind-blown particles frozen mid-motion.",
+
+    "ultra dark background (near-black with warm firelight orange glow), "
+    "roots, branches, or organic tendrils reaching from the shadows.",
+]
+
+
+def _pick_style() -> str:
+    override = os.getenv("COVER_STYLE_SUFFIX")
+    if override:
+        return override
+    return f"{random.choice(_STYLE_VARIANTS)} {_BASE_STYLE}"
 
 
 # ── Публічні функції ──────────────────────────────────────────────────────────
@@ -126,7 +164,7 @@ def _plan_cover(transcript: str) -> tuple:
 Поверни ТІЛЬКИ валідний JSON (без markdown, без коментарів):
 {
   "hook_text": "КОРОТКА ФРАЗА АБО ПИТАННЯ 3-6 СЛІВ ВЕЛИКИМИ ЛІТЕРАМИ мовою транскрипції",
-  "dalle_prompt": "English description of ONE powerful atmospheric visual: a concept, silhouette, or abstract element that represents the video topic metaphorically. No text, no faces. 1-2 sentences."
+  "dalle_prompt": "English description of ONE powerful atmospheric visual that represents the video topic metaphorically. No text, no faces. 1-2 sentences."
 }
 
 Правила hook_text:
@@ -134,6 +172,19 @@ def _plan_cover(transcript: str) -> tuple:
 - Це емоційна зачіпка: питання, шок, або несподівана думка.
 - Приклади хороших: "ЩО ПІСЛЯ ГІПНОТЕРАПІЇ?", "ГЕН ВІЙНИ", "МОЗОК ВАС ОБМАНЮЄ", "90% ЛЮДЕЙ НЕ ЗНАЮТЬ".
 - Приклади поганих: "РОЗПОВІДАЮ ПРО ГІПНОЗ", "ТЕМА СЬОГОДНІ: СТРАХ".
+
+Правила dalle_prompt — РІЗНОМАНІТНІСТЬ найважливіша: обери об'єкт/сцену, що
+підходить САМЕ ЦІЙ темі, а не завжди одне й те саме "glowing silhouette".
+Обирай з різних категорій залежно від змісту, наприклад:
+- людська постать ЗІ СПИНИ або в профіль (ніколи обличчям до камери)
+- побутовий предмет-символ: дзеркало, ключ, замок, годинник, маска, ланцюг
+  (цілий або розірваний), двері, лабіринт, шахи
+- природна стихія: вогонь/дим, вода/хвилі, коріння дерева, шторм/блискавка,
+  туман
+- архітектура/геометрія: сходи, коридор, розбите скло, геометричні форми
+- абстракція: частинки світла, туман, дим, що складається у форму
+Уникай повторювати той самий тип об'єкта, що й у попередній обкладинці (якщо
+з контексту видно попередню тему) — шукай несподіваний, але доречний образ.
 """
 
     resp = client.chat.completions.create(
@@ -169,7 +220,7 @@ def _fal_generate(concept_prompt: str) -> Image.Image:
 
     import fal_client
 
-    full_prompt = f"{concept_prompt}. {COVER_STYLE_SUFFIX}"
+    full_prompt = f"{concept_prompt}. {_pick_style()}"
 
     # Встановлюємо ключ для fal-client (він читає змінну середовища FAL_KEY,
     # але встановлюємо явно для надійності)

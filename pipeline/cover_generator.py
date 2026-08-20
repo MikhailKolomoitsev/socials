@@ -283,7 +283,7 @@ def _compose(bg_image: Image.Image, hook_text: str) -> str:
 
     # ── Hook TEXT — зверху ────────────────────────────────────────────────────
     if hook_text:
-        font_size = 104
+        font_size = 80  # було 104 — за проханням трохи менший надпис
         font = _load_font(font_size)
         lines = _wrap(hook_text, font, max_width=COVER_WIDTH - 80)
         line_h = font_size + 18
@@ -295,7 +295,7 @@ def _compose(bg_image: Image.Image, hook_text: str) -> str:
             x = (COVER_WIDTH - tw) // 2
 
             # Товстий чорний stroke (робить текст читабельним на будь-якому фоні)
-            stroke_w = 6
+            stroke_w = 5
             for dx in range(-stroke_w, stroke_w + 1):
                 for dy in range(-stroke_w, stroke_w + 1):
                     if abs(dx) + abs(dy) <= stroke_w + 2:

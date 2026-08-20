@@ -283,7 +283,7 @@ def _compose(bg_image: Image.Image, hook_text: str) -> str:
 
     # ── Hook TEXT — зверху ────────────────────────────────────────────────────
     if hook_text:
-        font_size = 100  # було 104 — за проханням трохи менший надпис (-4pt)
+        font_size = 83  # було 104 — за проханням ~80% від оригінального розміру
         font = _load_font(font_size)
         lines = _wrap(hook_text, font, max_width=COVER_WIDTH - 80)
         line_h = font_size + 18

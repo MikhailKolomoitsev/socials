@@ -508,12 +508,16 @@ def get_unpublished_tiktok_videos(limit: int = 15, offset: int = 0) -> list:
     """Оброблені відео, ще НЕ відправлені в TikTok (tiktok_video_id IS NULL) —
     для кнопки "Неопубліковані тіктоки". Відправка повністю ручна (кнопка
     publish_tt:<id>, main.py:handle_publish_tiktok_callback) — жодного
-    автоматичного розкладу/черги для TikTok більше немає."""
+    автоматичного розкладу/черги для TikTok більше немає.
+
+    ORDER BY created_at DESC — найновіші (найімовірніше актуальні/потрібні
+    просто зараз) першими, а не найстаріший бэклог з червня-липня, до якого
+    інакше довелось би гортати кілька сторінок пагінації."""
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT * FROM videos
             WHERE tiktok_video_id IS NULL
-            ORDER BY created_at ASC
+            ORDER BY created_at DESC
             LIMIT ? OFFSET ?
         """, (limit, offset)).fetchall()
     return [dict(r) for r in rows]

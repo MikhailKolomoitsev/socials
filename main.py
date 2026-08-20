@@ -775,6 +775,10 @@ async def handle_publish_tiktok_callback(update: Update, context: ContextTypes.D
     Direct Post API без App Review недоступний). asyncio.to_thread — бо
     publish_video чекає на PUBLISH_COMPLETE до ~6.7 хв (_wait_for_publish),
     інакше заблокувало б увесь бот на цей час.
+
+    Після успіху ЩОРАЗУ (і перша відправка, і повторна) дублює обкладинку й
+    підпис окремими повідомленнями — щоб не гортати чат до оригінального
+    відео (особливо для старого бэклогу, де воно може бути дуже далеко).
     """
     query = update.callback_query
     await query.answer()
@@ -813,18 +817,23 @@ async def handle_publish_tiktok_callback(update: Update, context: ContextTypes.D
                 InlineKeyboardButton("📸 Запостити в Instagram", callback_data=f"publish_ig:{video_id}")
             ]]),
         )
-        # При повторній відправці обкладинку й підпис НЕ шлемо наново (щоб не
-        # смітити в чаті) — замість цього коротке reply-посилання на
-        # оригінальне повідомлення з відео, під яким вони вже лежать.
-        if is_resend and video.get("chat_id") and video.get("message_id"):
+        # Дублюємо обкладинку й підпис для ЦЬОГО відео — окремими
+        # повідомленнями в той самий чат, що й кнопка. cover_s3_url —
+        # публічний URL, Telegram сам підтягує його без завантаження файлу.
+        target_chat_id = video.get("chat_id") or query.message.chat_id
+        if video.get("cover_s3_url"):
             try:
-                await context.bot.send_message(
-                    chat_id=video["chat_id"],
-                    text="📋 Обкладинка і підпис — дивись повідомлення під оригінальним відео вище ⬆️",
-                    reply_to_message_id=video["message_id"],
+                await context.bot.send_photo(
+                    chat_id=target_chat_id, photo=video["cover_s3_url"], caption="🖼 Обкладинка",
                 )
-            except TgBadRequest:
-                pass  # оригінальне повідомлення видалене/недоступне — пропускаємо
+            except Exception as e:
+                logger.warning(f"Не вдалось надіслати обкладинку: {e}")
+        if caption:
+            await context.bot.send_message(
+                chat_id=target_chat_id,
+                text=f"📋 Підпис для TikTok — натисни щоб скопіювати:\n\n<pre>{html.escape(caption)}</pre>",
+                parse_mode="HTML",
+            )
     except Exception as e:
         logger.error(f"Помилка відправки в TikTok: {e}", exc_info=True)
         await query.edit_message_text(f"❌ Помилка відправки в TikTok: {e}")

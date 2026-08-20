@@ -1510,6 +1510,37 @@ async def _auto_publish_youtube(video_id: int, local_video_path: str, title: str
         return f"📺 YouTube: не вдалось опублікувати ({e})\n\n"
 
 
+ERROR_MESSAGE_TTL_SECONDS = 300  # 5 хв
+
+
+async def _delete_message_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    try:
+        await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
+    except Exception as e:
+        # Повідомлення могло бути вже видалене вручну, або чат недоступний —
+        # не критично, це лише прибирання сміття в чаті.
+        logger.debug(f"Не вдалось видалити повідомлення про помилку: {e}")
+
+
+def _schedule_error_message_deletion(job_queue, chat_id: int, message_id: int):
+    """
+    Планує видалення повідомлення "❌ Помилка обробки..." з чату через
+    ERROR_MESSAGE_TTL_SECONDS — сам факт помилки не губиться: запис уже
+    лежить у failed_videos (db.log_failed_video, викликаний ДО цього) і
+    лишається доступним через "⚠️ Невдалі відео" (/failed_videos) з кнопкою
+    "Спробувати ще раз" — видаляється лише повідомлення в чаті, не сам запис.
+    """
+    if not job_queue:
+        return  # job_queue вимкнено (напр. у тестовому середовищі) — пропускаємо
+    job_queue.run_once(
+        _delete_message_job,
+        when=ERROR_MESSAGE_TTL_SECONDS,
+        data={"chat_id": chat_id, "message_id": message_id},
+        name=f"delete_error_msg_{chat_id}_{message_id}",
+    )
+
+
 async def _process_video_file(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1668,10 +1699,12 @@ async def _process_video_file(
             )
             await msg.edit_text(
                 f"❌ Помилка обробки: {e}\n\n"
-                f"Додав у {BTN_FAILED} — можна спробувати ще раз кнопкою."
+                f"Додав у {BTN_FAILED} — можна спробувати ще раз кнопкою "
+                f"(це повідомлення саме зникне за {ERROR_MESSAGE_TTL_SECONDS // 60} хв)."
             )
         else:
             await msg.edit_text(f"❌ Помилка обробки: {e}")
+        _schedule_error_message_deletion(context.job_queue, msg.chat_id, msg.message_id)
     finally:
         cleanup_paths = [local_path, no_silence_path, vertical_path, *ass_paths, *final_video_paths.values(), frame_path, cover_path]
         for path in cleanup_paths:
@@ -1964,10 +1997,12 @@ async def _process_drive_file(
             )
             await msg.edit_text(
                 f"❌ Помилка обробки «{filename}»: {e}\n\n"
-                f"Додав у {BTN_FAILED} — можна спробувати ще раз кнопкою."
+                f"Додав у {BTN_FAILED} — можна спробувати ще раз кнопкою "
+                f"(це повідомлення саме зникне за {ERROR_MESSAGE_TTL_SECONDS // 60} хв)."
             )
         else:
             await msg.edit_text(f"❌ Помилка обробки «{filename}»: {e}")
+        _schedule_error_message_deletion(app.job_queue, msg.chat_id, msg.message_id)
     finally:
         unmark_processing(file_id)
         cleanup_paths = [local_path, std_path, no_silence_path, vertical_path, *ass_paths, *final_video_paths.values(), frame_path, cover_path]

@@ -18,7 +18,7 @@ import os
 import random
 import uuid
 from config import TMP_DIR, OPENAI_API_KEY, ASSEMBLYAI_API_KEY
-from pipeline.ffmpeg_processor import extract_audio
+from pipeline.ffmpeg_processor import extract_audio, has_audio_stream
 
 
 # ── Стилі субтитрів під платформу ────────────────────────────────────────────
@@ -63,6 +63,12 @@ def transcribe_words(video_path: str) -> tuple[list, list, str]:
     segments: сирі сегменти (fallback для build_ass_for_style, якщо
               word_tuples порожній).
     """
+    if not has_audio_stream(video_path):
+        # Відео без аудіодоріжки (напр. зняте без звуку) — extract_audio
+        # інакше впав би з "Output file does not contain any stream".
+        # Порожня транскрипція — той самий шлях, що й "Whisper нічого не
+        # розпізнав": main.py пропускає субтитри й підпис, обробка триває.
+        return [], [], ""
     if OPENAI_API_KEY:
         return _transcribe_whisper_words(video_path)
     elif ASSEMBLYAI_API_KEY:

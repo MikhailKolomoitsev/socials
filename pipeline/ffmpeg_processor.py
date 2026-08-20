@@ -309,6 +309,35 @@ def _probe_resolution(path: str) -> tuple:
     return stream["width"], stream["height"]
 
 
+def has_audio_stream(path: str) -> bool:
+    """
+    Перевіряє, чи є у файлі хоча б одна аудіодоріжка.
+
+    Деякі відео (напр. короткі iPhone-кліпи, зняті без звуку, або скріни
+    екрана) містять ЛИШЕ video stream. extract_audio() на такому файлі падав
+    з незрозумілим "Output file does not contain any stream" — mp3-енкодеру
+    нема з чого писати вихідний файл. Викликається ПЕРЕД extract_audio
+    (pipeline/transcriber.py:transcribe_words), щоб такі відео тихо йшли
+    далі без субтитрів (як і у випадку, коли Whisper не розпізнав мовлення),
+    а не падали в "⚠️ Невдалі відео" — retry там однаково не допоміг би,
+    бо звуку в самому файлі просто немає.
+    """
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=index", "-of", "json", path,
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return False
+    try:
+        streams = json.loads(result.stdout).get("streams", [])
+    except (json.JSONDecodeError, KeyError):
+        return False
+    return len(streams) > 0
+
+
 def extract_audio(video_path: str) -> str:
     """
     Витягує аудіодоріжку з відео у форматі mp3.

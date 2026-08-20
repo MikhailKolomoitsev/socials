@@ -100,6 +100,49 @@ def _pick_style() -> str:
     return f"{_STYLE_VARIANTS[index]} {_BASE_STYLE}"
 
 
+# ── Перегенерація за настроєм ("🌟 Яскравіше" / "🌑 Похмуріше" / "🎨 Незвичніше") ─
+#
+# На відміну від звичайної ротації (_pick_style, змінюється сама по собі раз
+# на 3 обкладинки), тут напрям обирає власник вручну — тому НЕ через
+# db.next_cover_generation_count() (це не мало б збивати звичайний каданс
+# ротації для наступних НЕ-перегенерованих обкладинок).
+MOOD_STYLES = {
+    "brighter": (
+        "brighter, higher-energy atmosphere — still cinematic, but with vivid saturated color "
+        "(warm gold, vivid teal, hot pink, or electric orange), a strong visible light source, "
+        "far less shadow than a typical dark moody shot."
+    ),
+    "darker": (
+        "much darker and more ominous atmosphere than usual — near-total black, heavy oppressive "
+        "shadow, only a single dim light source, unsettling and moody."
+    ),
+    "unusual": (
+        "deliberately strange and unexpected visual concept — an unconventional, surreal, "
+        "slightly bizarre composition that breaks from typical stock-photo framing, while "
+        "staying tasteful and relevant to the topic."
+    ),
+}
+
+
+def regenerate_cover_ai(transcript: str, mood: str) -> str:
+    """
+    Перегенерує обкладинку для ВЖЕ обробленого відео (кнопки "🌟/🌑/🎨" під
+    обкладинкою) — нові hook_text + image_prompt від GPT (не той самий, що
+    минулого разу — "незвична" мала б і сам концепт міняти, не лише колір),
+    background зі зміщенням у бік mood (MOOD_STYLES) замість звичайної
+    ротації стилю.
+
+    На відміну від generate_cover_ai() тут НЕМАЄ fallback на кадр з відео —
+    локальний файл кадру давно видалений (обробка вже завершилась), тож при
+    помилці просто піднімає виняток.
+    """
+    hook_text, image_prompt = _plan_cover(transcript)
+    logger.info(f"Regen cover ({mood}): «{hook_text}» | prompt: {image_prompt[:80]}…")
+    style_override = f"{MOOD_STYLES[mood]} {_BASE_STYLE}"
+    bg = _fal_generate(image_prompt, style_override=style_override)
+    return _compose(bg, hook_text)
+
+
 # ── Публічні функції ──────────────────────────────────────────────────────────
 
 def generate_cover_ai(transcript: str, frame_path: str) -> str:
@@ -213,7 +256,7 @@ def _plan_cover(transcript: str) -> tuple:
     return hook, prompt
 
 
-def _fal_generate(concept_prompt: str) -> Image.Image:
+def _fal_generate(concept_prompt: str, style_override: str = None) -> Image.Image:
     """
     fal.ai FLUX → PIL Image (1080×1920, нативний 9:16).
 
@@ -222,6 +265,10 @@ def _fal_generate(concept_prompt: str) -> Image.Image:
       - підтримує довільний розмір
       - час генерації: ~5-15 сек
 
+    style_override — готовий (уже з _BASE_STYLE) рядок стилю, напр. з
+    regenerate_cover_ai (mood-перегенерація) — якщо задано, звичайна
+    ротація (_pick_style, і її лічильник у БД) НЕ чіпається.
+
     Якщо FAL_KEY не задано — піднімає RuntimeError → fallback у generate_cover_ai.
     """
     if not FAL_KEY:
@@ -229,7 +276,8 @@ def _fal_generate(concept_prompt: str) -> Image.Image:
 
     import fal_client
 
-    full_prompt = f"{concept_prompt}. {_pick_style()}"
+    style = style_override if style_override is not None else _pick_style()
+    full_prompt = f"{concept_prompt}. {style}"
 
     # Встановлюємо ключ для fal-client (він читає змінну середовища FAL_KEY,
     # але встановлюємо явно для надійності)

@@ -362,6 +362,14 @@ def set_youtube_published(video_id: int, youtube_video_id: str):
         )
 
 
+def update_cover(video_id: int, cover_s3_url: str):
+    """Перезаписує обкладинку відео (main.py:handle_regen_cover_callback,
+    кнопки "🌟/🌑/🎨" під обкладинкою) — наступні публікації/дублювання
+    (напр. TikTok resend) підхоплять уже НОВУ обкладинку."""
+    with get_conn() as conn:
+        conn.execute("UPDATE videos SET cover_s3_url=? WHERE id=?", (cover_s3_url, video_id))
+
+
 def update_views(video_id: int, views: int):
     with get_conn() as conn:
         conn.execute("UPDATE videos SET views_at_check=? WHERE id=?", (views, video_id))

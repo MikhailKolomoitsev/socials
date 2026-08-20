@@ -69,7 +69,7 @@ from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 
 import requests as http_requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ReplyKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ReplyKeyboardMarkup, InputMediaPhoto
 from telegram.error import BadRequest as TgBadRequest
 from telegram.ext import (
     Application,
@@ -88,7 +88,7 @@ from config import (
 )
 from pipeline.ffmpeg_processor import to_standard_mp4, remove_silence, normalize_vertical, burn_subtitles, extract_frame, has_audio_stream
 from pipeline.transcriber import transcribe_words, build_ass_for_style, save_ass
-from pipeline.cover_generator import generate_cover_ai as generate_cover
+from pipeline.cover_generator import generate_cover_ai as generate_cover, regenerate_cover_ai
 from pipeline.caption_generator import generate_caption
 from pipeline.uploader import upload_file, delete_file as delete_s3_file
 from scheduler.queue_runner import run as queue_runner_run
@@ -417,6 +417,18 @@ def _video_topic(video: dict) -> str:
     if transcript:
         return transcript
     return "без теми"
+
+
+def _cover_regen_keyboard(video_id: int) -> InlineKeyboardMarkup:
+    """Кнопки під обкладинкою (де б вона не показувалась — після обробки,
+    або продубльована при публікації в TikTok) — перегенерувати в іншому
+    настрої, замінюючи фото ПРЯМО В ТОМУ Ж повідомленні
+    (handle_regen_cover_callback, через edit_message_media)."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🌟 Яскравіше", callback_data=f"regen_cover:{video_id}:brighter"),
+        InlineKeyboardButton("🌑 Похмуріше", callback_data=f"regen_cover:{video_id}:darker"),
+        InlineKeyboardButton("🎨 Незвичніше", callback_data=f"regen_cover:{video_id}:unusual"),
+    ]])
 
 
 def _build_tiktok_sent_page(offset: int) -> tuple:
@@ -758,6 +770,65 @@ async def handle_publish_ig_callback(update: Update, context: ContextTypes.DEFAU
         await query.edit_message_text(f"❌ Помилка публікації в Instagram: {e}")
 
 
+async def handle_regen_cover_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Кнопка "🌟 Яскравіше" / "🌑 Похмуріше" / "🎨 Незвичніше"
+    (regen_cover:<video_id>:<mood>) — перегенерує обкладинку в обраному
+    настрої (pipeline/cover_generator.py:regenerate_cover_ai) і замінює
+    фото ПРЯМО В ТОМУ Ж повідомленні через edit_message_media (не шле нове,
+    щоб не плодити повтори одної й тієї ж обкладинки в чаті).
+
+    Стара обкладинка на S3 видаляється (інакше сироти накопичувались би
+    назавжди — не критично, але немає сенсу платити за зберігання), а
+    videos.cover_s3_url оновлюється, щоб подальші публікації/дублювання
+    (напр. TikTok resend) уже брали нову.
+    """
+    query = update.callback_query
+    await query.answer("Генерую нову обкладинку...")
+
+    if not is_allowed(update):
+        return
+
+    _, video_id_str, mood = query.data.split(":", 2)
+    video_id = int(video_id_str)
+    video = db.get_video_by_id(video_id)
+    if not video:
+        await context.bot.send_message(chat_id=query.message.chat_id, text="❌ Відео не знайдено.")
+        return
+
+    try:
+        new_cover_path = await asyncio.to_thread(regenerate_cover_ai, video.get("transcript") or "", mood)
+    except Exception as e:
+        logger.error(f"Помилка перегенерації обкладинки: {e}", exc_info=True)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"❌ Не вдалось перегенерувати обкладинку: {e}",
+        )
+        return
+
+    try:
+        new_cover_url = await asyncio.to_thread(upload_file, new_cover_path, "covers")
+    finally:
+        try:
+            os.remove(new_cover_path)
+        except Exception:
+            pass
+
+    old_cover_url = video.get("cover_s3_url")
+    db.update_cover(video_id, new_cover_url)
+
+    if old_cover_url:
+        try:
+            await asyncio.to_thread(delete_s3_file, old_cover_url)
+        except Exception as e:
+            logger.warning(f"Не вдалось видалити стару обкладинку з S3: {e}")
+
+    await query.edit_message_media(
+        media=InputMediaPhoto(media=new_cover_url, caption="🖼 Обкладинка"),
+        reply_markup=_cover_regen_keyboard(video_id),
+    )
+
+
 async def handle_publish_tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Кнопка "📤 Відправити в TikTok" / "🔁 Відправити повторно"
@@ -825,6 +896,7 @@ async def handle_publish_tiktok_callback(update: Update, context: ContextTypes.D
             try:
                 await context.bot.send_photo(
                     chat_id=target_chat_id, photo=video["cover_s3_url"], caption="🖼 Обкладинка",
+                    reply_markup=_cover_regen_keyboard(video_id),
                 )
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати обкладинку: {e}")
@@ -1661,7 +1733,10 @@ async def _process_video_file(
             # Обкладинка окремим фото
             try:
                 with open(cover_path, "rb") as img:
-                    await update.message.reply_photo(photo=img, caption="🖼 Обкладинка")
+                    await update.message.reply_photo(
+                        photo=img, caption="🖼 Обкладинка",
+                        reply_markup=_cover_regen_keyboard(video_id),
+                    )
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати обкладинку: {e}")
 
@@ -1982,7 +2057,10 @@ async def _process_drive_file(
 
             try:
                 with open(cover_path, "rb") as img:
-                    await app.bot.send_photo(chat_id=chat_id, photo=img, caption="🖼 Обкладинка")
+                    await app.bot.send_photo(
+                        chat_id=chat_id, photo=img, caption="🖼 Обкладинка",
+                        reply_markup=_cover_regen_keyboard(video_id),
+                    )
             except Exception as e:
                 logger.warning(f"Не вдалось надіслати обкладинку: {e}")
 
@@ -2102,6 +2180,7 @@ def main():
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(CallbackQueryHandler(handle_publish_ig_callback, pattern=r"^publish_ig:"))
     app.add_handler(CallbackQueryHandler(handle_publish_tiktok_callback, pattern=r"^publish_tt:"))
+    app.add_handler(CallbackQueryHandler(handle_regen_cover_callback, pattern=r"^regen_cover:"))
     app.add_handler(CallbackQueryHandler(handle_publish_youtube_callback, pattern=r"^publish_yt:"))
     app.add_handler(CallbackQueryHandler(handle_retry_failed_callback, pattern=r"^retry_failed:"))
     app.add_handler(CallbackQueryHandler(handle_tiktok_pending_page_callback, pattern=r"^tp_page:"))

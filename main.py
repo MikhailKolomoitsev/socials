@@ -1852,20 +1852,35 @@ async def _drive_poll_job(context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Drive poller: нове відео «{filename}» ({size_mb} MB)")
         mark_processing(file_id)
 
-        msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"📂 Знайшов нове відео у Google Drive:\n<code>{html.escape(filename)}</code> ({size_mb} MB)\n\n⏳ Завантажую і починаю обробку...",
-            parse_mode="HTML",
-        )
-
+        # try/except НАВКОЛО ВСЬОГО тіла циклу (не лише download) — це
+        # обробка одного файлу з батчу з КІЛЬКОХ, знайдених за один прохід
+        # цього job'у. Без цього виняток з _process_drive_file (напр. з
+        # її ж except-гілки — Telegram API впав під час edit_text) пробивав
+        # би цей for-loop наскрізь і ВСІ наступні файли в тому самому
+        # батчі мовчки лишались би необробленими до наступного поллінгу
+        # (а якщо цей же виняток повторюється — то й довше). Кожен файл
+        # тепер повністю ізольований від сусідів у батчі.
         try:
-            local_path = await asyncio.to_thread(drive_download, file_id, filename)
-        except Exception as e:
-            unmark_processing(file_id)
-            await msg.edit_text(f"❌ Не вдалось завантажити «{filename}» з Drive: {e}")
-            continue
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"📂 Знайшов нове відео у Google Drive:\n<code>{html.escape(filename)}</code> ({size_mb} MB)\n\n⏳ Завантажую і починаю обробку...",
+                parse_mode="HTML",
+            )
 
-        await _process_drive_file(context.application, chat_id, msg, local_path, filename, file_id)
+            try:
+                local_path = await asyncio.to_thread(drive_download, file_id, filename)
+            except Exception as e:
+                unmark_processing(file_id)
+                await msg.edit_text(f"❌ Не вдалось завантажити «{filename}» з Drive: {e}")
+                continue
+
+            await _process_drive_file(context.application, chat_id, msg, local_path, filename, file_id)
+        except Exception as e:
+            # _process_drive_file сама ловить майже все — сюди потрапляють
+            # лише збої "навколо" неї (send_message, edit_text тощо). Не
+            # даємо їм зупинити обробку решти файлів у батчі.
+            logger.error(f"Drive poller: неочікувана помилка на «{filename}»: {e}", exc_info=True)
+            unmark_processing(file_id)
 
 
 async def _process_drive_file(

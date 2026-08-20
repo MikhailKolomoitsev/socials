@@ -85,6 +85,11 @@ INSTAGRAM_PUBLISH_HOUR = int(os.getenv("INSTAGRAM_PUBLISH_HOUR", "10"))
 # значенням — прибрати можна безпечно.
 INSTAGRAM_REELS_HOUR = int(os.getenv("INSTAGRAM_REELS_HOUR", "19"))
 
+# Скільки днів тримати відео (і файли на S3) перед тим, як вони стають
+# кандидатами на видалення командою /cleanup_old — саме видалення завжди
+# вимагає ручного підтвердження кнопкою, ніякого автоматичного прибирання.
+CLEANUP_MIN_AGE_DAYS = int(os.getenv("CLEANUP_MIN_AGE_DAYS", "30"))
+
 # Локальні папки
 TMP_DIR = "/tmp/socials"
 os.makedirs(TMP_DIR, exist_ok=True)

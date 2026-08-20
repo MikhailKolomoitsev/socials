@@ -434,6 +434,28 @@ def get_video_by_id(video_id: int) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def get_videos_older_than(days: int) -> list:
+    """Відео, оброблені понад `days` днів тому — для /cleanup_old (main.py).
+    Повертає всі поля (потрібні s3_url/s3_url_instagram/cover_s3_url, щоб
+    видалити відповідні файли зі сховища ПЕРЕД видаленням самого запису)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM videos WHERE datetime(created_at) <= datetime('now', ? || ' days') "
+            "ORDER BY created_at ASC",
+            (f"-{days}",),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_video(video_id: int):
+    """Незворотно видаляє запис відео з БД. Викликати ЛИШЕ після того, як
+    відповідні файли вже прибрані зі сховища (main.py:/cleanup_old) —
+    інакше файли на S3 лишаться сиротами назавжди (посилання на них
+    ніде більше немає)."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM videos WHERE id=?", (video_id,))
+
+
 # ── Queue ─────────────────────────────────────────────────────────────────────
 
 def enqueue_carousel(carousel_id: int, scheduled_at: datetime):

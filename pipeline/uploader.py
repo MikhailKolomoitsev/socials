@@ -61,6 +61,28 @@ def upload_file(local_path: str, prefix: str = "videos") -> str:
     return f"{S3_PUBLIC_BASE_URL.rstrip('/')}/{key}"
 
 
+def delete_file(url: str):
+    """
+    Видаляє файл з S3/R2 за його публічним URL (той самий S3_PUBLIC_BASE_URL-
+    префікс, що й upload_file повертає — тут просто відрізаємо його, щоб
+    дістати key). Використовується /cleanup_old (main.py) для видалення
+    старих відео/обкладинок разом з їхнім записом у БД.
+
+    Мовчки повертається, якщо url порожній — виклик з циклу над кількома
+    URL відео (не всі поля завжди заповнені, напр. s3_url_instagram може
+    дублювати s3_url) не має падати на None.
+    """
+    if not url:
+        return
+    base = S3_PUBLIC_BASE_URL.rstrip("/")
+    if not url.startswith(base + "/"):
+        raise ValueError(f"URL не належить S3_PUBLIC_BASE_URL ({base}): {url}")
+    key = url[len(base) + 1:]
+
+    s3 = get_s3_client()
+    s3.delete_object(Bucket=S3_BUCKET, Key=key)
+
+
 def _get_content_type(ext: str) -> str:
     types = {
         ".mp4": "video/mp4",

@@ -17,6 +17,8 @@ Telegram бот — точка входу.
   /queue          — заплановані Instagram-каруселі (TikTok/Reels — повністю ручні, у черзі їх немає)
   /publish_ig     — те саме, що /ig_pending, одним списком з реальними переглядами TikTok
   /nocap          — опублікувати карусель без підпису (пропустити крок підпису)
+  /cleanup_old    — видалити відео старіші за CLEANUP_MIN_AGE_DAYS днів (S3 +
+                    база), З ПІДТВЕРДЖЕННЯМ кнопкою — ніколи автоматично
 
 Сценарій відео:
   1. Надсилаєш відео в чат
@@ -82,13 +84,13 @@ import db
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, TMP_DIR,
     TIKTOK_PUBLISH_TIMES, TIKTOK_DAILY_LIMIT, INSTAGRAM_PUBLISH_HOUR,
-    YOUTUBE_CLIENT_ID,
+    YOUTUBE_CLIENT_ID, CLEANUP_MIN_AGE_DAYS,
 )
 from pipeline.ffmpeg_processor import to_standard_mp4, remove_silence, normalize_vertical, burn_subtitles, extract_frame
 from pipeline.transcriber import transcribe_words, build_ass_for_style, save_ass
 from pipeline.cover_generator import generate_cover_ai as generate_cover
 from pipeline.caption_generator import generate_caption
-from pipeline.uploader import upload_file
+from pipeline.uploader import upload_file, delete_file as delete_s3_file
 from scheduler.queue_runner import run as queue_runner_run
 from webapp.server import start_in_background as start_webapp
 from publishers.instagram import publish_reel, adapt_caption_for_instagram, get_valid_token_and_user_id, test_connection as ig_test_connection
@@ -1034,6 +1036,103 @@ async def handle_dm_blast_callback(update: Update, context: ContextTypes.DEFAULT
     await query.edit_message_text(report)
 
 
+# ── Очищення старих відео ─────────────────────────────────────────────────────
+#
+# /cleanup_old — незворотно видаляє відео (файли на S3: сам відео-файл,
+# instagram-варіант якщо окремий, обкладинка) і сам запис з БД. Навмисно
+# ЛИШЕ ручна команда з підтвердженням кнопкою — ніякого автоматичного/
+# фонового прибирання: занадто ризиковано для permanent delete, щоб робити
+# без явного тапу щоразу (навіть якби й хотілось "раз на тиждень само").
+
+async def cmd_cleanup_old(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Показує превʼю того, що буде видалено (відео старіші за
+    CLEANUP_MIN_AGE_DAYS днів, за замовчуванням 30), і просить підтвердження.
+    Нічого не видаляється без явного тапу "🗑 Так, видалити".
+    """
+    if not is_allowed(update):
+        return
+
+    videos = db.get_videos_older_than(CLEANUP_MIN_AGE_DAYS)
+    if not videos:
+        await update.message.reply_text(f"Немає відео, старіших за {CLEANUP_MIN_AGE_DAYS} днів.")
+        return
+
+    context.user_data["cleanup_video_ids"] = [v["id"] for v in videos]
+
+    lines = [f"🗑 Знайдено {len(videos)} відео, старіших за {CLEANUP_MIN_AGE_DAYS} днів:\n"]
+    for v in videos[:15]:
+        created = (v.get("created_at") or "")[:10]
+        topic = _video_topic(v)[:50]
+        lines.append(f"• {created} — {topic}")
+    if len(videos) > 15:
+        lines.append(f"…і ще {len(videos) - 15}.")
+    lines.append(
+        "\n⚠️ Це НАЗАВЖДИ видалить відео і обкладинки з S3 та самі записи з "
+        "бази — відмінити не можна. Публікації, які вже пішли в TikTok/"
+        "Instagram/YouTube, звісно, лишаться там — видаляється лише те, що "
+        "зберігається в цього бота."
+    )
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"🗑 Так, видалити {len(videos)}", callback_data="cleanup_confirm"),
+            InlineKeyboardButton("❌ Скасувати", callback_data="cleanup_cancel"),
+        ]]),
+    )
+
+
+async def handle_cleanup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_allowed(update):
+        return
+
+    if query.data == "cleanup_cancel":
+        context.user_data.pop("cleanup_video_ids", None)
+        await query.edit_message_text("Скасовано — нічого не видалено.")
+        return
+
+    video_ids = context.user_data.pop("cleanup_video_ids", None)
+    if not video_ids:
+        await query.edit_message_text(
+            "❌ Список застарів (можливо, бот перезапустився) — почни знову /cleanup_old."
+        )
+        return
+
+    await query.edit_message_text(f"🗑 Видаляю {len(video_ids)} відео...")
+
+    deleted = 0
+    s3_errors = []
+    for vid in video_ids:
+        video = db.get_video_by_id(vid)
+        if not video:
+            continue  # вже видалено якимось іншим шляхом — пропускаємо
+        urls = {video.get("s3_url"), video.get("s3_url_instagram"), video.get("cover_s3_url")}
+        for url in urls:
+            if not url:
+                continue
+            try:
+                await asyncio.to_thread(delete_s3_file, url)
+            except Exception as e:
+                logger.warning(f"Не вдалось видалити {url} з S3: {e}")
+                s3_errors.append(f"#{vid}: {e}")
+        db.delete_video(vid)
+        deleted += 1
+
+    report = f"✅ Видалено {deleted} відео (записи з бази і файли з S3)."
+    if s3_errors:
+        sample = "\n".join(s3_errors[:5])
+        report += (
+            f"\n\n⚠️ {len(s3_errors)} файлів не вдалось видалити з S3 (запис у "
+            f"базі однаково прибрано — файл-сирота лишився в бакеті):\n{sample}"
+        )
+
+    await query.edit_message_text(report)
+
+
 # ── Instagram карусель (сторітейл) ───────────────────────────────────────────
 #
 # Сценарій: надсилаєш кілька фото ОДНИМ альбомом у Telegram (готові слайди,
@@ -1885,6 +1984,7 @@ async def _post_init(app: Application):
         BotCommand("process_url", "Обробити відео за посиланням (якщо файл >20MB)"),
         BotCommand("nocap", "Опублікувати карусель без підпису"),
         BotCommand("dm_blast", "Розсилка в Instagram Direct"),
+        BotCommand("cleanup_old", f"Видалити відео старіші за {CLEANUP_MIN_AGE_DAYS} днів (з S3 і бази, з підтвердженням)"),
     ])
 
 
@@ -1915,6 +2015,7 @@ def main():
     app.add_handler(CommandHandler("failed_videos", cmd_failed_videos))
     app.add_handler(CommandHandler("test_ig", cmd_test_ig))
     app.add_handler(CommandHandler("dm_blast", cmd_dm_blast))
+    app.add_handler(CommandHandler("cleanup_old", cmd_cleanup_old))
     app.add_handler(CommandHandler("process_url", cmd_process_url))
     app.add_handler(CommandHandler("scan_drive", cmd_scan_drive))
     app.add_handler(CallbackQueryHandler(handle_drive_process_callback, pattern=r"^drive_process:"))
@@ -1930,6 +2031,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_stats_page_callback, pattern=r"^st_page:"))
     app.add_handler(CallbackQueryHandler(handle_failed_videos_page_callback, pattern=r"^fv_page:"))
     app.add_handler(CallbackQueryHandler(handle_dm_blast_callback, pattern=r"^dm_blast_(confirm|cancel)$"))
+    app.add_handler(CallbackQueryHandler(handle_cleanup_callback, pattern=r"^cleanup_(confirm|cancel)$"))
     app.add_handler(CommandHandler("nocap", cmd_nocap))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_carousel_photos))
     app.add_handler(CallbackQueryHandler(handle_carousel_schedule_callback, pattern=r"^schedule_carousel:"))

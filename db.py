@@ -124,6 +124,11 @@ def init_db():
                 reason TEXT,                   -- напр. 'no_audio'
                 skipped_at TEXT DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS cover_style_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                generation_count INTEGER NOT NULL DEFAULT 0
+            );
         """)
         _migrate(conn)
 
@@ -757,3 +762,20 @@ def get_failed_video_by_id(failed_id: int) -> Optional[dict]:
 def resolve_failed_video(failed_id: int):
     with get_conn() as conn:
         conn.execute("UPDATE failed_videos SET resolved=1 WHERE id=?", (failed_id,))
+
+
+# ── Обкладинки: лічильник для детермінованої ротації стилю ──────────────────
+
+def next_cover_generation_count() -> int:
+    """Атомарно інкрементує й повертає лічильник згенерованих обкладинок —
+    pipeline/cover_generator.py ділить його на 3, щоб стиль (колір/настрій
+    фону) міняв­ся рівно раз на 3 обкладинки, а не випадково (де той самий
+    стиль міг випасти двічі поспіль). У БД, а не в пам'яті процесу — інакше
+    лічильник скидався б при кожному редеплої на Railway."""
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO cover_style_state (id, generation_count) VALUES (1, 1)
+               ON CONFLICT(id) DO UPDATE SET generation_count = generation_count + 1"""
+        )
+        row = conn.execute("SELECT generation_count FROM cover_style_state WHERE id=1").fetchone()
+    return row["generation_count"]

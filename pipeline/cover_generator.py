@@ -21,12 +21,12 @@ import io
 import json
 import logging
 import os
-import random
 import uuid
 
 import requests as http_requests
 from PIL import Image, ImageDraw, ImageFont
 
+import db
 from config import TMP_DIR, OPENAI_API_KEY, FAL_KEY
 
 logger = logging.getLogger(__name__)
@@ -41,10 +41,14 @@ COVER_HEIGHT = 1920
 # ── DALL-E стиль блогу ────────────────────────────────────────────────────────
 # Спільна база (бренд-впізнаваність: темно, кінематографічно, без тексту/облич,
 # 9:16 — інакше логотип і hook-текст зверху/знизу не будуть читабельні) +
-# один із варіантів кольору/настрою, обраний ВИПАДКОВО щоразу (_pick_style),
-# щоб обкладинки не зливались в одну й ту саму темно-бірюзову картинку.
-# COVER_STYLE_SUFFIX (env) — явний override: якщо задано, рандомізація
-# вимикається і завжди йде саме цей стиль (як і раніше).
+# один із варіантів кольору/настрою. Раніше обирався ВИПАДКОВО (random.choice)
+# щоразу — але випадковість могла (і, судячи з фідбеку, реально випадала)
+# підряд обрати той самий стиль двічі-тричі, тож "різноманітність" на око не
+# відчувалась. Тепер — детермінована ротація через лічильник у БД
+# (db.next_cover_generation_count): стиль ГАРАНТОВАНО міняється рівно раз на
+# COVER_STYLE_ROTATE_EVERY обкладинок, по колу через усі варіанти.
+# COVER_STYLE_SUFFIX (env) — явний override: якщо задано, ротація вимикається
+# і завжди йде саме цей стиль (як і раніше).
 _BASE_STYLE = (
     "Cinematic volumetric lighting, high contrast, photorealistic digital art. "
     "No text, no watermarks, no faces, no readable words. "
@@ -84,11 +88,16 @@ _STYLE_VARIANTS = [
 ]
 
 
+COVER_STYLE_ROTATE_EVERY = 3
+
+
 def _pick_style() -> str:
     override = os.getenv("COVER_STYLE_SUFFIX")
     if override:
         return override
-    return f"{random.choice(_STYLE_VARIANTS)} {_BASE_STYLE}"
+    count = db.next_cover_generation_count()
+    index = ((count - 1) // COVER_STYLE_ROTATE_EVERY) % len(_STYLE_VARIANTS)
+    return f"{_STYLE_VARIANTS[index]} {_BASE_STYLE}"
 
 
 # ── Публічні функції ──────────────────────────────────────────────────────────

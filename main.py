@@ -86,7 +86,7 @@ from config import (
     TIKTOK_PUBLISH_TIMES, TIKTOK_DAILY_LIMIT, INSTAGRAM_PUBLISH_HOUR,
     YOUTUBE_CLIENT_ID, CLEANUP_MIN_AGE_DAYS,
 )
-from pipeline.ffmpeg_processor import to_standard_mp4, remove_silence, normalize_vertical, burn_subtitles, extract_frame
+from pipeline.ffmpeg_processor import to_standard_mp4, remove_silence, normalize_vertical, burn_subtitles, extract_frame, has_audio_stream
 from pipeline.transcriber import transcribe_words, build_ass_for_style, save_ass
 from pipeline.cover_generator import generate_cover_ai as generate_cover
 from pipeline.caption_generator import generate_caption
@@ -1536,6 +1536,17 @@ async def _process_video_file(
     tiktok_caption = None
 
     try:
+        # -1. Відео без звуку — пропускаємо повністю (не обробляємо, нікуди
+        #     не публікуємо). Це НЕ помилка (у "⚠️ Невдалі відео" не
+        #     потрапляє) — обробляються лише відео зі звуковою доріжкою.
+        if not await asyncio.to_thread(has_audio_stream, local_path):
+            db.mark_skipped(original_name, "no_audio")
+            await msg.edit_text(
+                f"⏭ «{original_name}» пропущено — немає звукової доріжки. "
+                "Обробляються лише відео зі звуком."
+            )
+            return
+
         # 0. Конвертуємо до стандартного H.264/AAC (MOV, HEVC, VFR → mp4 30fps)
         await msg.edit_text("🔄 Конвертую формат відео...")
         std_path = await asyncio.to_thread(to_standard_mp4, local_path)
@@ -1845,6 +1856,16 @@ async def _process_drive_file(
     tiktok_caption = None
 
     try:
+        # Відео без звуку — пропускаємо повністю, див. коментар у
+        # _process_video_file вище.
+        if not await asyncio.to_thread(has_audio_stream, local_path):
+            db.mark_skipped(filename, "no_audio")
+            await msg.edit_text(
+                f"⏭ «{filename}» пропущено — немає звукової доріжки. "
+                "Обробляються лише відео зі звуком."
+            )
+            return
+
         await msg.edit_text(f"🔄 «{filename}» — конвертую формат...")
         std_path = await asyncio.to_thread(to_standard_mp4, local_path)
 

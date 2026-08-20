@@ -117,6 +117,13 @@ def init_db():
                 failed_at TEXT DEFAULT (datetime('now')),
                 resolved INTEGER DEFAULT 0     -- 1 після успішного повторного запуску
             );
+
+            CREATE TABLE IF NOT EXISTS skipped_videos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                original_filename TEXT NOT NULL,
+                reason TEXT,                   -- напр. 'no_audio'
+                skipped_at TEXT DEFAULT (datetime('now'))
+            );
         """)
         _migrate(conn)
 
@@ -624,13 +631,34 @@ def get_dmed_igsids() -> set:
 
 
 def is_filename_known(filename: str) -> bool:
-    """Повертає True якщо відео з такою назвою вже є в БД (вже оброблялось раніше)."""
+    """Повертає True, якщо файл з такою назвою вже або оброблено (videos),
+    або свідомо пропущено (skipped_videos, напр. немає звуку) — щоб Drive-
+    поллер не намагався розпізнати/пропустити той самий файл знову на
+    кожному наступному циклі опитування (main.py:_drive_poll_job)."""
     with get_conn() as conn:
         row = conn.execute(
             "SELECT id FROM videos WHERE original_filename = ? LIMIT 1",
             (filename,),
         ).fetchone()
+        if row:
+            return True
+        row = conn.execute(
+            "SELECT id FROM skipped_videos WHERE original_filename = ? LIMIT 1",
+            (filename,),
+        ).fetchone()
     return row is not None
+
+
+def mark_skipped(filename: str, reason: str):
+    """Фіксує, що файл свідомо пропущений (не оброблявся) — див.
+    is_filename_known вище: без цього Drive-поллер намагався б пропустити
+    той самий файл щоразу заново, надсилаючи повідомлення в чат кожні
+    DRIVE_POLL_INTERVAL секунд нескінченно."""
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO skipped_videos (original_filename, reason) VALUES (?, ?)",
+            (filename, reason),
+        )
 
 
 def count_tiktoks_today() -> int:

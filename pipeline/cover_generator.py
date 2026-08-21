@@ -346,7 +346,7 @@ def _compose(bg_image: Image.Image, hook_text: str) -> str:
         font = _load_font(font_size)
         lines = _wrap(hook_text, font, max_width=COVER_WIDTH - 80)
         line_h = font_size + 18
-        y = 90   # відступ від верху
+        y = 90 + int(COVER_HEIGHT * 0.10)   # відступ від верху (+10% висоти за проханням)
 
         for line in lines:
             bbox = draw.textbbox((0, 0), line, font=font)

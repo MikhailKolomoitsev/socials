@@ -4,7 +4,9 @@
 Два режими:
   generate_cover_ai(transcript, frame_path)  — основний:
       1. GPT-4o витягує hook-текст (коротке питання або удар) + опис сцени
-      2. DALL-E 3 генерує темний атмосферний фон у стилі блогу
+      2. fal.ai FLUX генерує теплий, світлий, шамансько-балійський
+         медитативний фон (природа/ритуальні предмети — НЕ темний/похмурий,
+         контент сам по собі світлий, обкладинка має притягувати)
       3. Pillow накладає hook ЗВЕРХУ великим жирним шрифтом + логотип знизу
 
   generate_cover(frame_path, ...)  — fallback без AI
@@ -14,7 +16,7 @@
   2. DejaVuSans-Bold / LiberationSans-Bold (системні)
   3. PIL default
 
-Стиль DALL-E перевизначається через env COVER_STYLE_SUFFIX.
+Стиль fal.ai перевизначається через env COVER_STYLE_SUFFIX.
 """
 
 import io
@@ -38,53 +40,58 @@ FONT_PATH   = os.path.join(ASSETS_DIR, "fonts", "font.ttf")  # кастомни�
 COVER_WIDTH  = 1080
 COVER_HEIGHT = 1920
 
-# ── DALL-E стиль блогу ────────────────────────────────────────────────────────
-# Спільна база (бренд-впізнаваність: темно, кінематографічно, без тексту/облич,
-# 9:16 — інакше логотип і hook-текст зверху/знизу не будуть читабельні) +
-# один із варіантів кольору/настрою. Раніше обирався ВИПАДКОВО (random.choice)
-# щоразу — але випадковість могла (і, судячи з фідбеку, реально випадала)
-# підряд обрати той самий стиль двічі-тричі, тож "різноманітність" на око не
-# відчувалась. Тепер — детермінована ротація через лічильник у БД
+# ── Стиль обкладинки ──────────────────────────────────────────────────────────
+# ДО (не робити знову): кожен варіант починався з "ultra dark background
+# (almost black...)" — тобто попри 10 "різних" варіантів усі однаково
+# похмуро-чорно-бірюзові, а контент (психологія/гіпнотерапія) сам по собі
+# світлий і заспокійливий — обкладинка відштовхувала замість притягувати.
+# ТЕПЕР: тепла, світла, шамансько-балійська медитативна естетика — природа,
+# сонячне світло, предмети для медитації/ритуалу. Спільна база (бренд-
+# впізнаваність: м'яке природне світло, без тексту/облич, 9:16 — інакше
+# логотип і hook-текст зверху/знизу не будуть читабельні) + один із варіантів
+# настрою/сцени. Детермінована ротація через лічильник у БД
 # (db.next_cover_generation_count): стиль ГАРАНТОВАНО міняється рівно раз на
-# COVER_STYLE_ROTATE_EVERY обкладинок, по колу через усі варіанти.
+# COVER_STYLE_ROTATE_EVERY обкладинок, по колу через усі варіанти — без
+# ризику випадково обрати те саме двічі поспіль.
 # COVER_STYLE_SUFFIX (env) — явний override: якщо задано, ротація вимикається
-# і завжди йде саме цей стиль (як і раніше).
+# і завжди йде саме цей стиль.
 _BASE_STYLE = (
-    "Cinematic volumetric lighting, high contrast, photorealistic digital art. "
+    "Soft warm natural light, golden-hour glow, photorealistic, serene and "
+    "inviting atmosphere — never dark, gloomy, or ominous. "
     "No text, no watermarks, no faces, no readable words. "
     "Aspect ratio 9:16 portrait."
 )
 
 _STYLE_VARIANTS = [
-    "ultra dark background (almost black with deep teal or indigo hints), "
-    "one powerful central subject — a glowing silhouette or abstract geometric shape.",
+    "warm golden sunlight filtering through tropical palm leaves, soft dappled "
+    "light, lush green and amber tones, peaceful jungle atmosphere.",
 
-    "ultra dark background (near-black with deep crimson or burgundy undertones), "
-    "one dramatic central subject bathed in a single warm red rim light.",
+    "a Balinese stone temple offering (canang sari) with flower petals and "
+    "gently curling incense smoke, warm morning sunlight, soft blurred background.",
 
-    "ultra dark background (charcoal black with cold cyan-blue accent light), "
-    "a stark architectural or geometric structure fading into shadow.",
+    "dew drops on a lotus leaf resting on calm turquoise water, gentle morning "
+    "mist, soft warm light, tranquil close-up.",
 
-    "ultra dark background (black with warm amber and bronze glow), "
-    "a single object wreathed in drifting smoke or embers.",
+    "incense smoke curling upward through a warm sunbeam, a simple wooden bowl "
+    "and lit candle nearby, cozy meditative still life.",
 
-    "ultra dark background (deep violet-black with faint magenta haze), "
-    "a surreal, dreamlike shape suspended in empty space.",
+    "sunrise over misty green mountains, warm pink-and-orange sky, silhouettes "
+    "of palm trees at the edge of frame, no people.",
 
-    "near-black monochrome background with ONE sharp accent color streak "
-    "(electric green, gold, or icy blue), minimalist and stark.",
+    "smooth river stones and natural crystals arranged on raw light wood, soft "
+    "warm glow, minimalist meditation altar.",
 
-    "ultra dark background (almost black with subtle emerald-teal fog), "
-    "rippling water or fractured glass catching a single light source.",
+    "a single feather drifting through warm backlit sunlight, soft golden "
+    "bokeh, gentle and airy.",
 
-    "ultra dark background (deep indigo-black), a lone human silhouette from "
-    "behind or in profile, never facing camera, backlit by a distant glow.",
+    "sunlight rays filtering through a bamboo forest, warm green and gold "
+    "tones, calm and grounding.",
 
-    "ultra dark background (black with cold steel-blue moonlight), "
-    "storm clouds, lightning, or wind-blown particles frozen mid-motion.",
+    "ocean waves at golden hour, warm amber light reflecting on the water, "
+    "wide and calming horizon.",
 
-    "ultra dark background (near-black with warm firelight orange glow), "
-    "roots, branches, or organic tendrils reaching from the shadows.",
+    "a softly glowing brass singing bowl with rippling water inside, warm "
+    "candlelight around it, serene close-up.",
 ]
 
 
@@ -108,18 +115,17 @@ def _pick_style() -> str:
 # ротації для наступних НЕ-перегенерованих обкладинок).
 MOOD_STYLES = {
     "brighter": (
-        "brighter, higher-energy atmosphere — still cinematic, but with vivid saturated color "
-        "(warm gold, vivid teal, hot pink, or electric orange), a strong visible light source, "
-        "far less shadow than a typical dark moody shot."
+        "even brighter and more vibrant — vivid saturated warm color (bright gold, coral, "
+        "turquoise, or sunny orange), strong direct sunlight, high energy and joyful."
     ),
     "darker": (
-        "much darker and more ominous atmosphere than usual — near-total black, heavy oppressive "
-        "shadow, only a single dim light source, unsettling and moody."
+        "deeper, quieter twilight atmosphere — still warm and serene (not ominous or scary), "
+        "richer amber/indigo dusk tones, more shadow and depth, calm and grounding rather than gloomy."
     ),
     "unusual": (
-        "deliberately strange and unexpected visual concept — an unconventional, surreal, "
-        "slightly bizarre composition that breaks from typical stock-photo framing, while "
-        "staying tasteful and relevant to the topic."
+        "deliberately dreamlike and surreal — a mystical, symbolic shamanic image (mandala "
+        "patterns, double-exposure nature imagery, spiritual symbolism), unexpected but still "
+        "warm, tasteful, and relevant to the topic."
     ),
 }
 
@@ -204,8 +210,8 @@ def _plan_cover(transcript: str) -> tuple:
                  стопнутись. Приклади: "ЩО ПІСЛЯ ГІПНОТЕРАПІЇ?",
                  "ГЕН ВІЙНИ", "МОЗОК ТЕБЕ ОБМАНЮЄ".
 
-    dalle_prompt: англійський опис ОДНОГО сильного атмосферного об'єкту або
-                  сцени (без тексту, без облич). 1-2 речення.
+    dalle_prompt: англійський опис ОДНОГО теплого, світлого, медитативного
+                  об'єкту або сцени (без тексту, без облич). 1-2 речення.
     """
     from openai import OpenAI
     client = OpenAI(api_key=OPENAI_API_KEY)
@@ -216,7 +222,7 @@ def _plan_cover(transcript: str) -> tuple:
 Поверни ТІЛЬКИ валідний JSON (без markdown, без коментарів):
 {
   "hook_text": "КОРОТКА ФРАЗА АБО ПИТАННЯ 3-6 СЛІВ ВЕЛИКИМИ ЛІТЕРАМИ мовою транскрипції",
-  "dalle_prompt": "English description of ONE powerful atmospheric visual that represents the video topic metaphorically. No text, no faces. 1-2 sentences."
+  "dalle_prompt": "English description of ONE warm, bright, meditative visual that represents the video topic metaphorically. No text, no faces. 1-2 sentences."
 }
 
 Правила hook_text:
@@ -225,18 +231,23 @@ def _plan_cover(transcript: str) -> tuple:
 - Приклади хороших: "ЩО ПІСЛЯ ГІПНОТЕРАПІЇ?", "ГЕН ВІЙНИ", "МОЗОК ВАС ОБМАНЮЄ", "90% ЛЮДЕЙ НЕ ЗНАЮТЬ".
 - Приклади поганих: "РОЗПОВІДАЮ ПРО ГІПНОЗ", "ТЕМА СЬОГОДНІ: СТРАХ".
 
-Правила dalle_prompt — РІЗНОМАНІТНІСТЬ найважливіша: обери об'єкт/сцену, що
-підходить САМЕ ЦІЙ темі, а не завжди одне й те саме "glowing silhouette".
+Правила dalle_prompt — стиль ЗАВЖДИ теплий, світлий, шамансько-балійський
+медитативний (сонячне світло, природа, ритуальні предмети) — НІКОЛИ темний,
+похмурий, зловісний чи тривожний, навіть якщо тема відео важка: контент сам
+по собі світлий і заспокійливий, обкладинка має притягувати, а не
+відштовхувати. РІЗНОМАНІТНІСТЬ у межах цього теплого стилю — обери
+об'єкт/сцену, що підходить САМЕ ЦІЙ темі, а не завжди одне й те саме.
 Обирай з різних категорій залежно від змісту, наприклад:
-- людська постать ЗІ СПИНИ або в профіль (ніколи обличчям до камери)
-- побутовий предмет-символ: дзеркало, ключ, замок, годинник, маска, ланцюг
-  (цілий або розірваний), двері, лабіринт, шахи
-- природна стихія: вогонь/дим, вода/хвилі, коріння дерева, шторм/блискавка,
-  туман
-- архітектура/геометрія: сходи, коридор, розбите скло, геометричні форми
-- абстракція: частинки світла, туман, дим, що складається у форму
+- природа й світло: сонячне проміння крізь листя/бамбук, ранковий туман у
+  горах, схід сонця над океаном, роса на листі лотоса
+- ритуальні/медитативні предмети: пахощі, свічки, чаша для співу, кристали
+  й каміння, квіткові підношення (canang sari), чотки
+- вода й спокій: хвилі на заході сонця, краплі води, тихе озеро
+- людська постать ЗІ СПИНИ або в профілі, у спокійній/медитативній позі,
+  підсвічена теплим світлом (ніколи обличчям до камери)
 Уникай повторювати той самий тип об'єкта, що й у попередній обкладинці (якщо
-з контексту видно попередню тему) — шукай несподіваний, але доречний образ.
+з контексту видно попередню тему) — шукай несподіваний, але доречний і
+теплий образ.
 """
 
     resp = client.chat.completions.create(

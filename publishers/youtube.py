@@ -27,6 +27,7 @@ from config import YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET
 logger = logging.getLogger(__name__)
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
+WEBSITE_URL = "https://kolomoitsev.com/"
 
 
 def get_valid_access_token() -> str:
@@ -77,6 +78,10 @@ def publish_short(local_video_path: str, title: str, description: str = "") -> s
     достатньо правильного aspect ratio (уже 9:16 з пайплайну) і/або хештегу
     #Shorts в description. title обрізається до 100 символів (ліміт YouTube).
 
+    До description ЗАВЖДИ дописується посилання на сайт (WEBSITE_URL) —
+    для обох шляхів публікації (автоматичного й ручного з "📺 Неопубліковані
+    Shorts"), бо додається тут, в одному спільному місці для обох викликів.
+
     Returns:
         YouTube video ID (https://youtube.com/shorts/<id>)
     """
@@ -87,6 +92,8 @@ def publish_short(local_video_path: str, title: str, description: str = "") -> s
     creds = Credentials(token=get_valid_access_token())
     youtube = build("youtube", "v3", credentials=creds)
 
+    if WEBSITE_URL not in description:
+        description = f"{description}\n\n🔗 {WEBSITE_URL}".strip()
     if "#shorts" not in description.lower():
         description = f"{description}\n\n#Shorts".strip()
 

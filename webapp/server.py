@@ -45,8 +45,11 @@ TIKTOK_SCOPES = "user.info.basic,video.upload,video.list"
 # стара авторизація без цього permission'у видавання повідомлень не дозволить.
 INSTAGRAM_SCOPES = "instagram_business_basic,instagram_business_content_publish,instagram_business_manage_messages"
 
-# YouTube Data API v3 — лише завантаження відео, без читання/керування каналом.
-YOUTUBE_SCOPES = "https://www.googleapis.com/auth/youtube.upload"
+# YouTube Data API v3 — youtube.upload не дозволяє thumbnails().set()
+# (кастомна обкладинка для Shorts), тому потрібен ширший scope. Зміна scope
+# вимагає повторного проходження /auth/youtube/login — старий refresh_token
+# видано під вужчий дозвіл і не підійде.
+YOUTUBE_SCOPES = "https://www.googleapis.com/auth/youtube"
 
 
 @app.route("/")

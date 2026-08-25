@@ -592,6 +592,7 @@ async def handle_publish_youtube_callback(update: Update, context: ContextTypes.
         title = video.get("tiktok_caption") or video.get("original_filename") or "Short"
         yt_video_id = await asyncio.to_thread(
             youtube_publish_short, local_path, title, video.get("transcript") or "",
+            video.get("cover_s3_url"),
         )
         db.set_youtube_published(video_id, yt_video_id)
         await query.edit_message_text(f"✅ Опубліковано в YouTube Shorts: https://youtube.com/shorts/{yt_video_id}")
@@ -1565,7 +1566,9 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def _auto_publish_youtube(video_id: int, local_video_path: str, title: str, description: str) -> str:
+async def _auto_publish_youtube(
+    video_id: int, local_video_path: str, title: str, description: str, cover_source: str = None,
+) -> str:
     """
     Автопублікація YouTube Shorts — ПОВНІСТЮ автоматично й публічно, без
     жодної кнопки (на відміну від TikTok/Instagram): YouTube Data API
@@ -1583,7 +1586,9 @@ async def _auto_publish_youtube(video_id: int, local_video_path: str, title: str
     if not YOUTUBE_CLIENT_ID:
         return ""
     try:
-        yt_video_id = await asyncio.to_thread(youtube_publish_short, local_video_path, title, description)
+        yt_video_id = await asyncio.to_thread(
+            youtube_publish_short, local_video_path, title, description, cover_source,
+        )
         db.set_youtube_published(video_id, yt_video_id)
         return f"📺 YouTube Shorts: https://youtube.com/shorts/{yt_video_id}\n\n"
     except Exception as e:
@@ -1754,6 +1759,7 @@ async def _process_video_file(
         await msg.edit_text("📺 Публікую в YouTube Shorts...")
         youtube_line = await _auto_publish_youtube(
             video_id, final_video_paths["tiktok"], tiktok_caption or original_name, transcript or "",
+            cover_path,
         )
 
         # 9. TikTok НЕ відправляється автоматично — власник сам тисне кнопку,
@@ -2076,6 +2082,7 @@ async def _process_drive_file(
         await msg.edit_text(f"📺 «{filename}» — публікую в YouTube Shorts...")
         youtube_line = await _auto_publish_youtube(
             video_id, final_video_paths["tiktok"], tiktok_caption or filename, transcript or "",
+            cover_path,
         )
 
         # TikTok НЕ відправляється автоматично — див. коментар у

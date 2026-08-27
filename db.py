@@ -572,13 +572,16 @@ def get_unpublished_youtube_videos(limit: int = 15, offset: int = 0) -> list:
     контент, готовий публікуватись (TikTok-чернетка вже пішла), а не будь-яке
     щойно оброблене відео. Найчастіше сюди потрапляють відео, оброблені ДО
     підключення /auth/youtube/login, або ті, де автопублікація впала
-    (main.py:_auto_publish_youtube)."""
+    (main.py:_auto_publish_youtube).
+
+    ORDER BY created_at DESC — найновіші першими, як і в інших пагінованих
+    списках (get_unpublished_tiktok_videos тощо)."""
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT * FROM videos
             WHERE youtube_video_id IS NULL
               AND tiktok_video_id IS NOT NULL
-            ORDER BY created_at ASC
+            ORDER BY created_at DESC
             LIMIT ? OFFSET ?
         """, (limit, offset)).fetchall()
     return [dict(r) for r in rows]
@@ -591,12 +594,14 @@ def get_youtube_failed_videos(limit: int = 15, offset: int = 0) -> list:
     одразу після обробки для КОЖНОГО відео (main.py:_auto_publish_youtube),
     незалежно від того, чи вже натиснута кнопка "Відправити в TikTok", тому
     цей список — саме ті випадки, де auto-publish впав (invalid_grant,
-    мережева помилка тощо), для окремого списку "Помилки YouTube"."""
+    мережева помилка тощо), для окремого списку "Помилки YouTube".
+
+    ORDER BY created_at DESC — найновіші першими."""
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT * FROM videos
             WHERE youtube_video_id IS NULL
-            ORDER BY created_at ASC
+            ORDER BY created_at DESC
             LIMIT ? OFFSET ?
         """, (limit, offset)).fetchall()
     return [dict(r) for r in rows]

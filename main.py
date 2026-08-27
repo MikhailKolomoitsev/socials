@@ -63,6 +63,7 @@ Telegram бот — точка входу.
 import asyncio
 import html
 import logging
+import math
 import os
 import threading
 import uuid
@@ -133,13 +134,16 @@ BTN_FAILED = "⚠️ Невдалі відео"
 # рівно PAGE_SIZE елементів означає, що далі, ймовірно, є ще).
 PAGE_SIZE = 15
 
-# Якщо фінальне відео довше за цей поріг — ріжемо на VIDEO_SPLIT_PARTS
-# окремих частин, кожна публікується/надсилається як самостійне відео
-# (_process_video_file/_process_drive_file). Обкладинку генеруємо один раз
-# на все відео (дорого — GPT + fal.ai) і лише домальовуємо напис
-# "ЧАСТИНА N/M" на копії для кожної частини (cover_generator.add_part_label).
-VIDEO_SPLIT_THRESHOLD_SECONDS = 90  # 1.5 хв
-VIDEO_SPLIT_PARTS = 2
+# Якщо фінальне відео довше за цей поріг — ріжемо його на стільки частин,
+# щоб кожна вкладалась приблизно у VIDEO_SPLIT_TARGET_SECONDS (динамічно:
+# ceil(тривалість / ціль) — напр. 4.5 хв при цілі 3 хв дає 2 частини по
+# ~2.25 хв, 7 хв дає 3 частини по ~2.33 хв). Кожна частина далі
+# публікується/надсилається як самостійне відео (_process_video_file/
+# _process_drive_file). Обкладинку генеруємо один раз на все відео
+# (дорого — GPT + fal.ai) і лише домальовуємо напис "ЧАСТИНА N/M" на копії
+# для кожної частини (cover_generator.add_part_label).
+VIDEO_SPLIT_THRESHOLD_SECONDS = 180  # 3 хв
+VIDEO_SPLIT_TARGET_SECONDS = 180  # 3 хв
 
 
 def _main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -1764,7 +1768,7 @@ async def _process_video_file(
         #      кроки 6-9 як самостійне відео (свій S3 upload, свій запис у
         #      БД, свої кнопки публікації).
         duration = await asyncio.to_thread(get_duration, final_video_paths["tiktok"])
-        num_parts = VIDEO_SPLIT_PARTS if duration > VIDEO_SPLIT_THRESHOLD_SECONDS else 1
+        num_parts = math.ceil(duration / VIDEO_SPLIT_TARGET_SECONDS) if duration > VIDEO_SPLIT_THRESHOLD_SECONDS else 1
         if num_parts > 1:
             await msg.edit_text(f"✂️ Відео задовге ({int(duration)}с) — ріжу на {num_parts} частини...")
             tiktok_parts = await asyncio.to_thread(split_video, final_video_paths["tiktok"], num_parts)
@@ -2136,7 +2140,7 @@ async def _process_drive_file(
         # Якщо фінальне відео задовге — ріжемо на частини, див. коментар у
         # _process_video_file вище (крок 5.5).
         duration = await asyncio.to_thread(get_duration, final_video_paths["tiktok"])
-        num_parts = VIDEO_SPLIT_PARTS if duration > VIDEO_SPLIT_THRESHOLD_SECONDS else 1
+        num_parts = math.ceil(duration / VIDEO_SPLIT_TARGET_SECONDS) if duration > VIDEO_SPLIT_THRESHOLD_SECONDS else 1
         if num_parts > 1:
             await msg.edit_text(f"✂️ «{filename}» — відео задовге ({int(duration)}с), ріжу на {num_parts} частини...")
             tiktok_parts = await asyncio.to_thread(split_video, final_video_paths["tiktok"], num_parts)

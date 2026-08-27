@@ -7,6 +7,7 @@ Telegram бот — точка входу.
   🎬 Неопубліковані Reels    /ig_pending      — TikTok-відео ще не в Instagram
   📸 Опубліковані Reels      /ig_sent         — вже в Instagram, є "відправити повторно"
   📺 Неопубліковані Shorts   /youtube_pending — вже в TikTok, ще НЕ в YouTube Shorts
+  📺⚠️ Помилки YouTube       /youtube_failed  — будь-яке відео з помилкою автопублікації, є "спробувати ще раз"
   📊 Статистика              /stats           — перегляди/лайки/коменти + рекомендації
   ⚠️ Невдалі відео           /failed_videos   — обробка впала, є "спробувати ще раз"
 Кожен список пагінований (кнопка "▶️ Показати ще", якщо є більше).
@@ -122,6 +123,7 @@ BTN_TIKTOK_SENT = "✅ Відправлені тіктоки"
 BTN_IG_PENDING = "🎬 Неопубліковані Reels"
 BTN_IG_SENT = "📸 Опубліковані Reels"
 BTN_YOUTUBE_PENDING = "📺 Неопубліковані Shorts"
+BTN_YOUTUBE_FAILED = "📺⚠️ Помилки YouTube"
 BTN_STATS = "📊 Статистика"
 BTN_FAILED = "⚠️ Невдалі відео"
 
@@ -137,8 +139,8 @@ def _main_menu_keyboard() -> ReplyKeyboardMarkup:
         [
             [BTN_TIKTOK_PENDING, BTN_TIKTOK_SENT],
             [BTN_IG_PENDING, BTN_IG_SENT],
-            [BTN_YOUTUBE_PENDING, BTN_STATS],
-            [BTN_FAILED],
+            [BTN_YOUTUBE_PENDING, BTN_YOUTUBE_FAILED],
+            [BTN_STATS, BTN_FAILED],
         ],
         resize_keyboard=True,
     )
@@ -171,6 +173,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{BTN_IG_PENDING} — TikTok-відео, ще не опубліковані в Instagram, з переходом до відео в чаті\n"
         f"{BTN_IG_SENT} — відео, вже опубліковані в Instagram, з кнопкою «Відправити повторно»\n"
         f"{BTN_YOUTUBE_PENDING} — відео, вже в TikTok, ще НЕ в YouTube Shorts, з кнопкою публікації\n"
+        f"{BTN_YOUTUBE_FAILED} — усі відео з помилкою автопублікації в YouTube Shorts, з кнопкою «Спробувати ще раз»\n"
         f"{BTN_STATS} — перегляди/лайки/коменти TikTok і що варто запостити в Instagram\n"
         f"{BTN_FAILED} — відео, де обробка впала, з кнопкою «Спробувати ще раз»\n\n"
         "Раз на ~3 дні також нагадаю обрати відео для Instagram Reels і/або "
@@ -554,6 +557,47 @@ async def handle_youtube_pending_page_callback(update: Update, context: ContextT
         return
     offset = int(query.data.split(":", 1)[1])
     text, markup = _build_youtube_pending_page(offset)
+    await query.edit_message_text(text, reply_markup=markup)
+
+
+def _build_youtube_failed_page(offset: int) -> tuple:
+    """Повертає (text, markup) для сторінки "Помилки YouTube" —
+    youtube_video_id IS NULL, БЕЗ вимоги tiktok_video_id (на відміну від
+    _build_youtube_pending_page): показує всі відео, де автопублікація в
+    YouTube впала (наприклад invalid_grant після відкликаного токена), а не
+    лише ті, що вже відправлені в TikTok. Кнопка на кожне — publish_yt:<id>
+    (той самий handle_publish_youtube_callback)."""
+    videos = db.get_youtube_failed_videos(limit=PAGE_SIZE, offset=offset)
+    if not videos:
+        text = "✅ Немає відео з помилкою публікації в YouTube Shorts." if offset == 0 else "Більше немає."
+        return text, None
+
+    buttons = []
+    for v in videos:
+        created = (v.get("created_at") or "")[:16]
+        label = f"{created} · {_video_topic(v)[:36]}"
+        buttons.append([InlineKeyboardButton(label[:64], callback_data=f"publish_yt:{v['id']}")])
+    if len(videos) == PAGE_SIZE:
+        buttons.append([InlineKeyboardButton("▶️ Показати ще", callback_data=f"yf_page:{offset + PAGE_SIZE}")])
+
+    count_label = f"(з {offset + 1})" if offset else str(len(videos))
+    return f"📺⚠️ Помилки публікації в YouTube {count_label}.\nОбери яке спробувати ще раз:", InlineKeyboardMarkup(buttons)
+
+
+async def cmd_youtube_failed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    text, markup = _build_youtube_failed_page(0)
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def handle_youtube_failed_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(update):
+        return
+    offset = int(query.data.split(":", 1)[1])
+    text, markup = _build_youtube_failed_page(offset)
     await query.edit_message_text(text, reply_markup=markup)
 
 
@@ -2148,6 +2192,7 @@ async def _post_init(app: Application):
         BotCommand("ig_pending", "TikTok-відео, ще не опубліковані в Instagram (з переходом у чат)"),
         BotCommand("ig_sent", "Відео, вже опубліковані в Instagram (є «відправити повторно»)"),
         BotCommand("youtube_pending", "Відео в TikTok, ще не опубліковані в YouTube Shorts"),
+        BotCommand("youtube_failed", "Відео з помилкою публікації в YouTube Shorts (є «спробувати ще раз»)"),
         BotCommand("publish_ig", "Те саме, що ig_pending, одним списком з реальними переглядами TikTok"),
         BotCommand("stats", "Перегляди/лайки/коменти TikTok + що варто запостити в Instagram"),
         BotCommand("failed_videos", "Відео, де обробка впала (є «спробувати ще раз»)"),
@@ -2181,6 +2226,7 @@ def main():
     app.add_handler(CommandHandler("ig_pending", cmd_ig_pending))
     app.add_handler(CommandHandler("ig_sent", cmd_ig_sent))
     app.add_handler(CommandHandler("youtube_pending", cmd_youtube_pending))
+    app.add_handler(CommandHandler("youtube_failed", cmd_youtube_failed))
     app.add_handler(CommandHandler("tiktok_pending", cmd_tiktok_pending))
     app.add_handler(CommandHandler("tiktok_sent", cmd_tiktok_sent))
     app.add_handler(CommandHandler("stats", cmd_stats))
@@ -2201,6 +2247,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_tiktok_sent_page_callback, pattern=r"^ts_page:"))
     app.add_handler(CallbackQueryHandler(handle_ig_sent_page_callback, pattern=r"^is_page:"))
     app.add_handler(CallbackQueryHandler(handle_youtube_pending_page_callback, pattern=r"^yp_page:"))
+    app.add_handler(CallbackQueryHandler(handle_youtube_failed_page_callback, pattern=r"^yf_page:"))
     app.add_handler(CallbackQueryHandler(handle_stats_page_callback, pattern=r"^st_page:"))
     app.add_handler(CallbackQueryHandler(handle_failed_videos_page_callback, pattern=r"^fv_page:"))
     app.add_handler(CallbackQueryHandler(handle_dm_blast_callback, pattern=r"^dm_blast_(confirm|cancel)$"))
@@ -2215,6 +2262,7 @@ def main():
     app.add_handler(MessageHandler(filters.Text([BTN_IG_PENDING]), cmd_ig_pending))
     app.add_handler(MessageHandler(filters.Text([BTN_IG_SENT]), cmd_ig_sent))
     app.add_handler(MessageHandler(filters.Text([BTN_YOUTUBE_PENDING]), cmd_youtube_pending))
+    app.add_handler(MessageHandler(filters.Text([BTN_YOUTUBE_FAILED]), cmd_youtube_failed))
     app.add_handler(MessageHandler(filters.Text([BTN_STATS]), cmd_stats))
     app.add_handler(MessageHandler(filters.Text([BTN_FAILED]), cmd_failed_videos))
     # Вільний текст — тільки для підпису каруселі, що очікує на нього (див.

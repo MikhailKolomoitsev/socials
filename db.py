@@ -584,6 +584,24 @@ def get_unpublished_youtube_videos(limit: int = 15, offset: int = 0) -> list:
     return [dict(r) for r in rows]
 
 
+def get_youtube_failed_videos(limit: int = 15, offset: int = 0) -> list:
+    """Усі відео, ще НЕ опубліковані в YouTube Shorts (youtube_video_id IS
+    NULL) — БЕЗ вимоги tiktok_video_id (на відміну від
+    get_unpublished_youtube_videos): автопублікація в YouTube спрацьовує
+    одразу після обробки для КОЖНОГО відео (main.py:_auto_publish_youtube),
+    незалежно від того, чи вже натиснута кнопка "Відправити в TikTok", тому
+    цей список — саме ті випадки, де auto-publish впав (invalid_grant,
+    мережева помилка тощо), для окремого списку "Помилки YouTube"."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM videos
+            WHERE youtube_video_id IS NULL
+            ORDER BY created_at ASC
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ── Carousels (сторітейли) ───────────────────────────────────────────────────
 
 def create_carousel(image_urls: list, caption: str = "") -> int:

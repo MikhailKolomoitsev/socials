@@ -1568,32 +1568,33 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _auto_publish_youtube(
     video_id: int, local_video_path: str, title: str, description: str, cover_source: str = None,
-) -> str:
+) -> tuple[str, bool]:
     """
     Автопублікація YouTube Shorts — ПОВНІСТЮ автоматично й публічно, без
     жодної кнопки (на відміну від TikTok/Instagram): YouTube Data API
     дозволяє справжню публікацію для особистого каналу без App Review, тому
     механізм "чернетка + ручний тап" тут просто не потрібен.
 
-    Мовчки пропускає (повертає ""), якщо YOUTUBE_CLIENT_ID не задано —
-    інтеграція ще не підключена (/auth/youtube/login) — решта пайплайну
-    (TikTok/Instagram) при цьому не ламається.
+    Мовчки пропускає (повертає ("", False)), якщо YOUTUBE_CLIENT_ID не
+    задано — інтеграція ще не підключена (/auth/youtube/login) — решта
+    пайплайну (TikTok/Instagram) при цьому не ламається.
 
-    Повертає готовий рядок для фінального повідомлення (посилання на Short
-    або текст помилки) — щоб не губити провал мовчки: показуємо власнику
-    навіть якщо публікація в YouTube не вдалась.
+    Повертає (рядок для фінального повідомлення, чи була помилка) — щоб не
+    губити провал мовчки: показуємо власнику навіть якщо публікація в
+    YouTube не вдалась, і даємо кнопку "спробувати ще раз" (publish_yt:<id>,
+    той самий callback, що й у списку "📺 Неопубліковані Shorts").
     """
     if not YOUTUBE_CLIENT_ID:
-        return ""
+        return "", False
     try:
         yt_video_id = await asyncio.to_thread(
             youtube_publish_short, local_video_path, title, description, cover_source,
         )
         db.set_youtube_published(video_id, yt_video_id)
-        return f"📺 YouTube Shorts: https://youtube.com/shorts/{yt_video_id}\n\n"
+        return f"📺 YouTube Shorts: https://youtube.com/shorts/{yt_video_id}\n\n", False
     except Exception as e:
         logger.warning(f"YouTube publish failed: {e}", exc_info=True)
-        return f"📺 YouTube: не вдалось опублікувати ({e})\n\n"
+        return f"📺 YouTube: не вдалось опублікувати ({e})\n\n", True
 
 
 ERROR_MESSAGE_TTL_SECONDS = 300  # 5 хв
@@ -1757,7 +1758,7 @@ async def _process_video_file(
         #      видалений (cleanup лише у finally нижче) — саме тому цей крок
         #      МАЄ бути до нього: YouTube API не вміє "pull from URL".
         await msg.edit_text("📺 Публікую в YouTube Shorts...")
-        youtube_line = await _auto_publish_youtube(
+        youtube_line, youtube_failed = await _auto_publish_youtube(
             video_id, final_video_paths["tiktok"], tiktok_caption or original_name, transcript or "",
             cover_path,
         )
@@ -1770,13 +1771,16 @@ async def _process_video_file(
             if transcript and transcript.strip()
             else "📝 Мовлення не розпізнано (без субтитрів)\n\n"
         )
+        final_buttons = [[InlineKeyboardButton("📤 Відправити в TikTok", callback_data=f"publish_tt:{video_id}")]]
+        if youtube_failed:
+            final_buttons.append(
+                [InlineKeyboardButton("📺 Опублікувати знову в YouTube", callback_data=f"publish_yt:{video_id}")]
+            )
         await msg.edit_text(
             f"✅ Відео готове!\n\n{transcript_line}{youtube_line}"
             "Тисни кнопку, коли захочеш відправити в TikTok:",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📤 Відправити в TikTok", callback_data=f"publish_tt:{video_id}")
-            ]]),
+            reply_markup=InlineKeyboardMarkup(final_buttons),
         )
 
     except Exception as e:
@@ -2080,7 +2084,7 @@ async def _process_drive_file(
         # YouTube Shorts — повністю автоматично, публічно, без кнопки. Див.
         # коментар у _auto_publish_youtube (main.py) вище.
         await msg.edit_text(f"📺 «{filename}» — публікую в YouTube Shorts...")
-        youtube_line = await _auto_publish_youtube(
+        youtube_line, youtube_failed = await _auto_publish_youtube(
             video_id, final_video_paths["tiktok"], tiktok_caption or filename, transcript or "",
             cover_path,
         )
@@ -2088,13 +2092,16 @@ async def _process_drive_file(
         # TikTok НЕ відправляється автоматично — див. коментар у
         # _process_video_file вище.
         transcript_line = f"📝 <i>{html.escape(transcript[:100])}...</i>\n\n" if transcript and transcript.strip() else ""
+        final_buttons = [[InlineKeyboardButton("📤 Відправити в TikTok", callback_data=f"publish_tt:{video_id}")]]
+        if youtube_failed:
+            final_buttons.append(
+                [InlineKeyboardButton("📺 Опублікувати знову в YouTube", callback_data=f"publish_yt:{video_id}")]
+            )
         await msg.edit_text(
             f"✅ «{html.escape(filename)}» готове!\n\n{transcript_line}{youtube_line}"
             "Тисни кнопку, коли захочеш відправити в TikTok:",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📤 Відправити в TikTok", callback_data=f"publish_tt:{video_id}")
-            ]]),
+            reply_markup=InlineKeyboardMarkup(final_buttons),
         )
 
     except Exception as e:

@@ -106,6 +106,55 @@ def _probe_duration(path: str) -> float:
     return float(json.loads(result.stdout)["format"]["duration"])
 
 
+def get_duration(path: str) -> float:
+    """Публічна обгортка над _probe_duration — щоб main.py міг перевірити
+    тривалість фінального відео (для авто-розбиття задовгих відео на
+    частини) без прямого звернення до приватної функції модуля."""
+    return _probe_duration(path)
+
+
+def split_video(input_path: str, num_parts: int = 2) -> list:
+    """
+    Ріже відео на `num_parts` рівних (за тривалістю) частин.
+
+    Використовується, коли фінальне відео задовге для одного TikTok/YouTube
+    Shorts посту (main.py: поріг ~1.5 хв) — власник отримує кожну частину
+    окремим постом з власними кнопками публікації.
+
+    На відміну від _trim_and_concat (де кожен сегмент потім склеюється в
+    один файл через concat demuxer), тут кожна частина — САМОСТІЙНИЙ
+    вихідний файл, тому склейка не потрібна, лише trim+re-encode (той самий
+    підхід, що й для сегментів у _trim_and_concat: -ss/-to з перекодуванням,
+    бо -c copy може різати не на keyframe і псувати частину).
+    """
+    duration = _probe_duration(input_path)
+    part_duration = duration / num_parts
+
+    output_paths = []
+    for i in range(num_parts):
+        start = i * part_duration
+        end = duration if i == num_parts - 1 else (i + 1) * part_duration
+        output_path = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_part{i + 1}.mp4")
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{start:.3f}",
+            "-to", f"{end:.3f}",
+            "-i", input_path,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "128k",
+            "-avoid_negative_ts", "make_zero",
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            tail = "\n".join(result.stderr.strip().splitlines()[-15:])
+            raise RuntimeError(f"ffmpeg помилка (split частина {i + 1}): {tail}")
+        output_paths.append(output_path)
+
+    return output_paths
+
+
 def _detect_silence(path: str, threshold_db: float, min_duration: float) -> list:
     """Повертає список (start, end) тихих інтервалів через ffmpeg silencedetect."""
     cmd = [

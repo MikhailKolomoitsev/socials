@@ -87,9 +87,9 @@ from config import (
     TIKTOK_PUBLISH_TIMES, TIKTOK_DAILY_LIMIT, INSTAGRAM_PUBLISH_HOUR,
     YOUTUBE_CLIENT_ID, CLEANUP_MIN_AGE_DAYS,
 )
-from pipeline.ffmpeg_processor import to_standard_mp4, remove_silence, normalize_vertical, burn_subtitles, extract_frame, has_audio_stream
+from pipeline.ffmpeg_processor import to_standard_mp4, remove_silence, normalize_vertical, burn_subtitles, extract_frame, has_audio_stream, get_duration, split_video
 from pipeline.transcriber import transcribe_words, build_ass_for_style, save_ass
-from pipeline.cover_generator import generate_cover_ai as generate_cover, regenerate_cover_ai
+from pipeline.cover_generator import generate_cover_ai as generate_cover, regenerate_cover_ai, add_part_label
 from pipeline.caption_generator import generate_caption
 from pipeline.uploader import upload_file, delete_file as delete_s3_file
 from scheduler.queue_runner import run as queue_runner_run
@@ -132,6 +132,14 @@ BTN_FAILED = "⚠️ Невдалі відео"
 # "▶️ Показати ще" з'являється, лише коли сторінка вийшла повною (евристика:
 # рівно PAGE_SIZE елементів означає, що далі, ймовірно, є ще).
 PAGE_SIZE = 15
+
+# Якщо фінальне відео довше за цей поріг — ріжемо на VIDEO_SPLIT_PARTS
+# окремих частин, кожна публікується/надсилається як самостійне відео
+# (_process_video_file/_process_drive_file). Обкладинку генеруємо один раз
+# на все відео (дорого — GPT + fal.ai) і лише домальовуємо напис
+# "ЧАСТИНА N/M" на копії для кожної частини (cover_generator.add_part_label).
+VIDEO_SPLIT_THRESHOLD_SECONDS = 90  # 1.5 хв
+VIDEO_SPLIT_PARTS = 2
 
 
 def _main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -1696,6 +1704,7 @@ async def _process_video_file(
     frame_path = None
     cover_path = None
     tiktok_caption = None
+    split_cleanup = []
 
     try:
         # -1. Відео без звуку — пропускаємо повністю (не обробляємо, нікуди
@@ -1743,89 +1752,128 @@ async def _process_video_file(
             final_video_paths["tiktok"] = vertical_path
             final_video_paths["instagram"] = vertical_path
 
-        # 5. Обкладинка (кадр однаковий незалежно від стилю субтитрів)
+        # 5. Обкладинка (кадр однаковий незалежно від стилю субтитрів) —
+        #    генерується ОДИН РАЗ на все вихідне відео, навіть якщо нижче
+        #    воно ріжеться на кілька частин (крок 5.5).
         await msg.edit_text("🖼 Генерую обкладинку...")
         frame_path = extract_frame(final_video_paths["tiktok"], timestamp=1.5)
         cover_path = generate_cover(transcript, frame_path)
 
-        # 6. Завантаження на S3 (2 відео + обкладинка)
-        await msg.edit_text("☁️ Завантажую на S3...")
-        s3_video_url = upload_file(final_video_paths["tiktok"], prefix="videos")
-        s3_video_url_instagram = (
-            upload_file(final_video_paths["instagram"], prefix="videos")
-            if final_video_paths["instagram"] != final_video_paths["tiktok"]
-            else s3_video_url
-        )
-        s3_cover_url = upload_file(cover_path, prefix="covers")
+        # 5.5. Якщо фінальне відео довше VIDEO_SPLIT_THRESHOLD_SECONDS —
+        #      ріжемо на VIDEO_SPLIT_PARTS частин; кожна далі проходить
+        #      кроки 6-9 як самостійне відео (свій S3 upload, свій запис у
+        #      БД, свої кнопки публікації).
+        duration = await asyncio.to_thread(get_duration, final_video_paths["tiktok"])
+        num_parts = VIDEO_SPLIT_PARTS if duration > VIDEO_SPLIT_THRESHOLD_SECONDS else 1
+        if num_parts > 1:
+            await msg.edit_text(f"✂️ Відео задовге ({int(duration)}с) — ріжу на {num_parts} частини...")
+            tiktok_parts = await asyncio.to_thread(split_video, final_video_paths["tiktok"], num_parts)
+            split_cleanup.extend(tiktok_parts)
+            if final_video_paths["instagram"] != final_video_paths["tiktok"]:
+                instagram_parts = await asyncio.to_thread(split_video, final_video_paths["instagram"], num_parts)
+                split_cleanup.extend(instagram_parts)
+            else:
+                instagram_parts = tiktok_parts
+        else:
+            tiktok_parts = [final_video_paths["tiktok"]]
+            instagram_parts = [final_video_paths["instagram"]]
 
-        # 7. Зберігаємо в БД (chat_id/message_id — щоб пізніше нагадування й
-        #    /ig_pending могли послатись на це повідомлення як reply, тобто
-        #    дати "перехід" до самого відео в чаті)
-        video_id = db.create_video(
-            original_filename=original_name,
-            s3_url=s3_video_url,
-            s3_url_instagram=s3_video_url_instagram,
-            cover_s3_url=s3_cover_url,
-            transcript=transcript,
-            chat_id=update.effective_chat.id,
-            message_id=msg.message_id,
-        )
-
-        # 8. Надсилаємо обкладинку + підпис окремим повідомленням (code-блок = кнопка Copy)
+        # Підпис (GPT) генерується ОДИН РАЗ і використовується для кожної
+        # частини — так само, як і обкладинка.
         if transcript and transcript.strip():
             try:
                 tiktok_caption = await asyncio.to_thread(generate_caption, transcript, "tiktok")
-                db.set_tiktok_caption_draft(video_id, tiktok_caption)
             except Exception as e:
                 logger.warning(f"Caption generation failed: {e}")
                 tiktok_caption = None
 
-            # Обкладинка окремим фото
-            try:
-                with open(cover_path, "rb") as img:
-                    await update.message.reply_photo(
-                        photo=img, caption="🖼 Обкладинка",
-                        reply_markup=_cover_regen_keyboard(video_id),
-                    )
-            except Exception as e:
-                logger.warning(f"Не вдалось надіслати обкладинку: {e}")
+        for i in range(num_parts):
+            part_num = i + 1
+            part_label = f" (частина {part_num}/{num_parts})" if num_parts > 1 else ""
+            cover_for_part = add_part_label(cover_path, part_num, num_parts) if num_parts > 1 else cover_path
+            if num_parts > 1:
+                split_cleanup.append(cover_for_part)
 
-            # Підпис окремим повідомленням у code-блоку → Telegram показує кнопку Copy
+            # 6. Завантаження на S3 (відео + обкладинка цієї частини)
+            await msg.edit_text(f"☁️ Завантажую на S3{part_label}...")
+            s3_video_url = upload_file(tiktok_parts[i], prefix="videos")
+            s3_video_url_instagram = (
+                upload_file(instagram_parts[i], prefix="videos")
+                if instagram_parts[i] != tiktok_parts[i]
+                else s3_video_url
+            )
+            s3_cover_url = upload_file(cover_for_part, prefix="covers")
+
+            # 7. Зберігаємо в БД (chat_id/message_id — щоб пізніше нагадування й
+            #    /ig_pending могли послатись на це повідомлення як reply, тобто
+            #    дати "перехід" до самого відео в чаті)
+            video_id = db.create_video(
+                original_filename=f"{original_name}{part_label}",
+                s3_url=s3_video_url,
+                s3_url_instagram=s3_video_url_instagram,
+                cover_s3_url=s3_cover_url,
+                transcript=transcript,
+                chat_id=update.effective_chat.id,
+                message_id=msg.message_id,
+            )
+
+            # 8. Надсилаємо обкладинку + підпис окремим повідомленням (code-блок = кнопка Copy)
             if tiktok_caption:
+                db.set_tiktok_caption_draft(video_id, tiktok_caption)
+
+                # Обкладинка окремим фото
+                try:
+                    with open(cover_for_part, "rb") as img:
+                        await update.message.reply_photo(
+                            photo=img, caption=f"🖼 Обкладинка{part_label}",
+                            reply_markup=_cover_regen_keyboard(video_id),
+                        )
+                except Exception as e:
+                    logger.warning(f"Не вдалось надіслати обкладинку: {e}")
+
+                # Підпис окремим повідомленням у code-блоку → Telegram показує кнопку Copy
                 await update.message.reply_text(
-                    f"📋 Підпис для TikTok — натисни щоб скопіювати:\n\n<pre>{html.escape(tiktok_caption)}</pre>",
+                    f"📋 Підпис для TikTok{part_label} — натисни щоб скопіювати:\n\n"
+                    f"<pre>{html.escape(tiktok_caption)}</pre>",
                     parse_mode="HTML",
                 )
 
-        # 8.5. YouTube Shorts — публікується ПОВНІСТЮ АВТОМАТИЧНО (публічно,
-        #      без кнопки), на відміну від TikTok/Instagram. Local-файл ще не
-        #      видалений (cleanup лише у finally нижче) — саме тому цей крок
-        #      МАЄ бути до нього: YouTube API не вміє "pull from URL".
-        await msg.edit_text("📺 Публікую в YouTube Shorts...")
-        youtube_line, youtube_failed = await _auto_publish_youtube(
-            video_id, final_video_paths["tiktok"], tiktok_caption or original_name, transcript or "",
-            cover_path,
-        )
-
-        # 9. TikTok НЕ відправляється автоматично — власник сам тисне кнопку,
-        #    коли захоче (тут одразу, або пізніше зі списку "📋 Неопубліковані
-        #    тіктоки" — handle_publish_tiktok_callback).
-        transcript_line = (
-            f"📝 Транскрипція: <i>{html.escape(transcript[:100])}...</i>\n\n"
-            if transcript and transcript.strip()
-            else "📝 Мовлення не розпізнано (без субтитрів)\n\n"
-        )
-        final_buttons = [[InlineKeyboardButton("📤 Відправити в TikTok", callback_data=f"publish_tt:{video_id}")]]
-        if youtube_failed:
-            final_buttons.append(
-                [InlineKeyboardButton("📺 Опублікувати знову в YouTube", callback_data=f"publish_yt:{video_id}")]
+            # 8.5. YouTube Shorts — публікується ПОВНІСТЮ АВТОМАТИЧНО (публічно,
+            #      без кнопки), на відміну від TikTok/Instagram. Local-файл ще не
+            #      видалений (cleanup лише у finally нижче) — саме тому цей крок
+            #      МАЄ бути до нього: YouTube API не вміє "pull from URL".
+            await msg.edit_text(f"📺 Публікую в YouTube Shorts{part_label}...")
+            youtube_line, youtube_failed = await _auto_publish_youtube(
+                video_id, tiktok_parts[i], (tiktok_caption or original_name) + part_label, transcript or "",
+                cover_for_part,
             )
-        await msg.edit_text(
-            f"✅ Відео готове!\n\n{transcript_line}{youtube_line}"
-            "Тисни кнопку, коли захочеш відправити в TikTok:",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(final_buttons),
-        )
+
+            # 9. TikTok НЕ відправляється автоматично — власник сам тисне кнопку,
+            #    коли захоче (тут одразу, або пізніше зі списку "📋 Неопубліковані
+            #    тіктоки" — handle_publish_tiktok_callback).
+            transcript_line = (
+                f"📝 Транскрипція: <i>{html.escape(transcript[:100])}...</i>\n\n"
+                if transcript and transcript.strip()
+                else "📝 Мовлення не розпізнано (без субтитрів)\n\n"
+            )
+            final_buttons = [[InlineKeyboardButton("📤 Відправити в TikTok", callback_data=f"publish_tt:{video_id}")]]
+            if youtube_failed:
+                final_buttons.append(
+                    [InlineKeyboardButton("📺 Опублікувати знову в YouTube", callback_data=f"publish_yt:{video_id}")]
+                )
+            final_text = (
+                f"✅ Відео готове{part_label}!\n\n{transcript_line}{youtube_line}"
+                "Тисни кнопку, коли захочеш відправити в TikTok:"
+            )
+            if i == 0:
+                await msg.edit_text(final_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(final_buttons))
+            else:
+                # Перше повідомлення (msg) уже редаговане під частину 1 —
+                # для решти частин потрібні НОВІ повідомлення, інакше кнопки
+                # частини 1 просто зникнуть, перезаписані текстом частини 2.
+                await update.message.reply_text(
+                    final_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(final_buttons),
+                )
 
     except Exception as e:
         logger.error(f"Pipeline error: {e}", exc_info=True)
@@ -1844,7 +1892,10 @@ async def _process_video_file(
             await msg.edit_text(f"❌ Помилка обробки: {e}")
         _schedule_error_message_deletion(context.job_queue, msg.chat_id, msg.message_id)
     finally:
-        cleanup_paths = [local_path, no_silence_path, vertical_path, *ass_paths, *final_video_paths.values(), frame_path, cover_path]
+        cleanup_paths = [
+            local_path, no_silence_path, vertical_path, *ass_paths,
+            *final_video_paths.values(), frame_path, cover_path, *split_cleanup,
+        ]
         for path in cleanup_paths:
             if not path:
                 continue
@@ -2040,6 +2091,7 @@ async def _process_drive_file(
     final_video_paths = {}
     frame_path = cover_path = None
     tiktok_caption = None
+    split_cleanup = []
 
     try:
         # Відео без звуку — пропускаємо повністю, див. коментар у
@@ -2081,72 +2133,110 @@ async def _process_drive_file(
         frame_path = await asyncio.to_thread(extract_frame, final_video_paths["tiktok"], 1.5)
         cover_path = await asyncio.to_thread(generate_cover, transcript, frame_path)
 
-        await msg.edit_text(f"☁️ «{filename}» — завантажую на S3...")
-        s3_video_url = await asyncio.to_thread(upload_file, final_video_paths["tiktok"], "videos")
-        s3_video_url_instagram = (
-            await asyncio.to_thread(upload_file, final_video_paths["instagram"], "videos")
-            if final_video_paths["instagram"] != final_video_paths["tiktok"]
-            else s3_video_url
-        )
-        s3_cover_url = await asyncio.to_thread(upload_file, cover_path, "covers")
+        # Якщо фінальне відео задовге — ріжемо на частини, див. коментар у
+        # _process_video_file вище (крок 5.5).
+        duration = await asyncio.to_thread(get_duration, final_video_paths["tiktok"])
+        num_parts = VIDEO_SPLIT_PARTS if duration > VIDEO_SPLIT_THRESHOLD_SECONDS else 1
+        if num_parts > 1:
+            await msg.edit_text(f"✂️ «{filename}» — відео задовге ({int(duration)}с), ріжу на {num_parts} частини...")
+            tiktok_parts = await asyncio.to_thread(split_video, final_video_paths["tiktok"], num_parts)
+            split_cleanup.extend(tiktok_parts)
+            if final_video_paths["instagram"] != final_video_paths["tiktok"]:
+                instagram_parts = await asyncio.to_thread(split_video, final_video_paths["instagram"], num_parts)
+                split_cleanup.extend(instagram_parts)
+            else:
+                instagram_parts = tiktok_parts
+        else:
+            tiktok_parts = [final_video_paths["tiktok"]]
+            instagram_parts = [final_video_paths["instagram"]]
 
-        video_id = db.create_video(
-            original_filename=filename,
-            s3_url=s3_video_url,
-            s3_url_instagram=s3_video_url_instagram,
-            cover_s3_url=s3_cover_url,
-            transcript=transcript,
-            chat_id=chat_id,
-            message_id=msg.message_id,
-        )
-
-        # Підпис + обкладинка
+        # Підпис (GPT) — один раз, використовується для кожної частини.
         if transcript and transcript.strip():
             try:
                 tiktok_caption = await asyncio.to_thread(generate_caption, transcript, "tiktok")
-                db.set_tiktok_caption_draft(video_id, tiktok_caption)
             except Exception as e:
                 logger.warning(f"Caption generation failed: {e}")
                 tiktok_caption = None
 
-            try:
-                with open(cover_path, "rb") as img:
-                    await app.bot.send_photo(
-                        chat_id=chat_id, photo=img, caption="🖼 Обкладинка",
-                        reply_markup=_cover_regen_keyboard(video_id),
-                    )
-            except Exception as e:
-                logger.warning(f"Не вдалось надіслати обкладинку: {e}")
+        for i in range(num_parts):
+            part_num = i + 1
+            part_label = f" (частина {part_num}/{num_parts})" if num_parts > 1 else ""
+            cover_for_part = (
+                await asyncio.to_thread(add_part_label, cover_path, part_num, num_parts)
+                if num_parts > 1 else cover_path
+            )
+            if num_parts > 1:
+                split_cleanup.append(cover_for_part)
 
+            await msg.edit_text(f"☁️ «{filename}»{part_label} — завантажую на S3...")
+            s3_video_url = await asyncio.to_thread(upload_file, tiktok_parts[i], "videos")
+            s3_video_url_instagram = (
+                await asyncio.to_thread(upload_file, instagram_parts[i], "videos")
+                if instagram_parts[i] != tiktok_parts[i]
+                else s3_video_url
+            )
+            s3_cover_url = await asyncio.to_thread(upload_file, cover_for_part, "covers")
+
+            video_id = db.create_video(
+                original_filename=f"{filename}{part_label}",
+                s3_url=s3_video_url,
+                s3_url_instagram=s3_video_url_instagram,
+                cover_s3_url=s3_cover_url,
+                transcript=transcript,
+                chat_id=chat_id,
+                message_id=msg.message_id,
+            )
+
+            # Підпис + обкладинка
             if tiktok_caption:
+                db.set_tiktok_caption_draft(video_id, tiktok_caption)
+
+                try:
+                    with open(cover_for_part, "rb") as img:
+                        await app.bot.send_photo(
+                            chat_id=chat_id, photo=img, caption=f"🖼 Обкладинка{part_label}",
+                            reply_markup=_cover_regen_keyboard(video_id),
+                        )
+                except Exception as e:
+                    logger.warning(f"Не вдалось надіслати обкладинку: {e}")
+
                 await app.bot.send_message(
                     chat_id=chat_id,
-                    text=f"📋 Підпис для TikTok — натисни щоб скопіювати:\n\n<pre>{html.escape(tiktok_caption)}</pre>",
+                    text=f"📋 Підпис для TikTok{part_label} — натисни щоб скопіювати:\n\n"
+                         f"<pre>{html.escape(tiktok_caption)}</pre>",
                     parse_mode="HTML",
                 )
 
-        # YouTube Shorts — повністю автоматично, публічно, без кнопки. Див.
-        # коментар у _auto_publish_youtube (main.py) вище.
-        await msg.edit_text(f"📺 «{filename}» — публікую в YouTube Shorts...")
-        youtube_line, youtube_failed = await _auto_publish_youtube(
-            video_id, final_video_paths["tiktok"], tiktok_caption or filename, transcript or "",
-            cover_path,
-        )
-
-        # TikTok НЕ відправляється автоматично — див. коментар у
-        # _process_video_file вище.
-        transcript_line = f"📝 <i>{html.escape(transcript[:100])}...</i>\n\n" if transcript and transcript.strip() else ""
-        final_buttons = [[InlineKeyboardButton("📤 Відправити в TikTok", callback_data=f"publish_tt:{video_id}")]]
-        if youtube_failed:
-            final_buttons.append(
-                [InlineKeyboardButton("📺 Опублікувати знову в YouTube", callback_data=f"publish_yt:{video_id}")]
+            # YouTube Shorts — повністю автоматично, публічно, без кнопки. Див.
+            # коментар у _auto_publish_youtube (main.py) вище.
+            await msg.edit_text(f"📺 «{filename}»{part_label} — публікую в YouTube Shorts...")
+            youtube_line, youtube_failed = await _auto_publish_youtube(
+                video_id, tiktok_parts[i], (tiktok_caption or filename) + part_label, transcript or "",
+                cover_for_part,
             )
-        await msg.edit_text(
-            f"✅ «{html.escape(filename)}» готове!\n\n{transcript_line}{youtube_line}"
-            "Тисни кнопку, коли захочеш відправити в TikTok:",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(final_buttons),
-        )
+
+            # TikTok НЕ відправляється автоматично — див. коментар у
+            # _process_video_file вище.
+            transcript_line = f"📝 <i>{html.escape(transcript[:100])}...</i>\n\n" if transcript and transcript.strip() else ""
+            final_buttons = [[InlineKeyboardButton("📤 Відправити в TikTok", callback_data=f"publish_tt:{video_id}")]]
+            if youtube_failed:
+                final_buttons.append(
+                    [InlineKeyboardButton("📺 Опублікувати знову в YouTube", callback_data=f"publish_yt:{video_id}")]
+                )
+            final_text = (
+                f"✅ «{html.escape(filename)}»{part_label} готове!\n\n{transcript_line}{youtube_line}"
+                "Тисни кнопку, коли захочеш відправити в TikTok:"
+            )
+            if i == 0:
+                await msg.edit_text(final_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(final_buttons))
+            else:
+                # Перше повідомлення (msg) уже редаговане під частину 1 —
+                # для решти частин потрібні НОВІ повідомлення (msg.edit_text
+                # перезаписав би кнопки частини 1).
+                await app.bot.send_message(
+                    chat_id=chat_id, text=final_text, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(final_buttons),
+                )
 
     except Exception as e:
         logger.error(f"Drive pipeline error: {e}", exc_info=True)
@@ -2165,7 +2255,10 @@ async def _process_drive_file(
         _schedule_error_message_deletion(app.job_queue, msg.chat_id, msg.message_id)
     finally:
         unmark_processing(file_id)
-        cleanup_paths = [local_path, std_path, no_silence_path, vertical_path, *ass_paths, *final_video_paths.values(), frame_path, cover_path]
+        cleanup_paths = [
+            local_path, std_path, no_silence_path, vertical_path, *ass_paths,
+            *final_video_paths.values(), frame_path, cover_path, *split_cleanup,
+        ]
         for path in cleanup_paths:
             if not path:
                 continue

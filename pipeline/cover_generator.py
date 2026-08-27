@@ -199,6 +199,43 @@ def generate_cover(frame_path: str, title_text: str = "", subtitle_text: str = "
     return out
 
 
+def add_part_label(cover_path: str, part_number: int, total_parts: int) -> str:
+    """
+    Домальовує позначку "ЧАСТИНА N/M" поверх УЖЕ готової обкладинки — для
+    відео, розрізаних на частини через задовгу тривалість (main.py, поріг
+    ~1.5 хв). AI-генерація (GPT hook + fal.ai фон) відбувається ОДИН РАЗ на
+    все вихідне відео (дорого й повільно) — сюди приходить вже готовий
+    cover_path, і ця функція лише додає napис на копію, без повторної
+    генерації.
+
+    Бейдж — у верхньому правому куті (hook_text по центру зверху, логотип
+    знизу — кут завжди вільний), напівпрозора чорна плашка з білим текстом.
+    """
+    img = Image.open(cover_path).convert("RGBA")
+    draw = ImageDraw.Draw(img)
+
+    text = f"ЧАСТИНА {part_number}/{total_parts}"
+    font = _load_font(44)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    pad_x, pad_y, margin = 28, 16, 40
+    box_w, box_h = tw + pad_x * 2, th + pad_y * 2
+    x0, y0 = COVER_WIDTH - box_w - margin, margin
+    x1, y1 = x0 + box_w, y0 + box_h
+
+    badge = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ImageDraw.Draw(badge).rounded_rectangle([x0, y0, x1, y1], radius=box_h // 2, fill=(0, 0, 0, 190))
+    img = Image.alpha_composite(img, badge)
+
+    draw = ImageDraw.Draw(img)
+    draw.text((x0 + pad_x - bbox[0], y0 + pad_y - bbox[1]), text, font=font, fill=(255, 255, 255, 255))
+
+    out = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_cover_part{part_number}.jpg")
+    img.convert("RGB").save(out, "JPEG", quality=95)
+    return out
+
+
 # ── Внутрішні: AI pipeline ────────────────────────────────────────────────────
 
 def _plan_cover(transcript: str) -> tuple:

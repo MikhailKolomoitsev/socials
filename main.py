@@ -16,7 +16,7 @@ Telegram бот — точка входу.
   /start          — привітання, показує меню кнопок
   /status         — скільки відео опубліковано в TikTok сьогодні (з ліміту TIKTOK_DAILY_LIMIT)
   /queue          — заплановані Instagram-каруселі (TikTok/Reels — повністю ручні, у черзі їх немає)
-  /publish_ig     — те саме, що /ig_pending, одним списком з реальними переглядами TikTok
+  /publish_ig     — те саме, що /ig_pending, але з реальними переглядами TikTok в підписах
   /nocap          — опублікувати карусель без підпису (пропустити крок підпису)
   /cleanup_old    — видалити відео старіші за CLEANUP_MIN_AGE_DAYS днів (S3 +
                     база), З ПІДТВЕРДЖЕННЯМ кнопкою — ніколи автоматично
@@ -331,53 +331,49 @@ def _format_views(n: int) -> str:
     return str(n)
 
 
-async def cmd_ig_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /ig_pending — список TikTok-відео, які ще НЕ опубліковані в Instagram.
+def _build_ig_pending_page(offset: int) -> tuple:
+    """Повертає (text, markup) для сторінки "Неопубліковані Reels"
+    (tiktok_video_id IS NOT NULL, instagram_media_id IS NULL). Кнопка на
+    кожне — publish_ig:<id> (handle_publish_ig_callback).
 
-    На відміну від /publish_ig (одне повідомлення зі списком кнопок), тут
-    кожне відео надсилається ОКРЕМИМ повідомленням-відповіддю (reply) на
-    оригінальне повідомлення з відео в чаті — тап на цитату над повідомленням
-    перегортає чат прямо до самого відео, щоб можна було освіжити в пам'яті,
-    що там за контент, перед тим як публікувати. Кнопка "Запостити в
-    Instagram" одразу публікує — те саме, що й у /publish_ig.
-    """
+    Раніше /ig_pending надсилало КОЖНЕ відео окремим повідомленням-відповіддю
+    на оригінал у чаті (щоб тапнути цитату й перестрибнути до відео) — при
+    15 відео це 16 повідомлень підряд, засмічували чат. Тепер — один список
+    кнопок, як і в усіх інших "*_pending" командах (/tiktok_pending,
+    /youtube_pending)."""
+    videos = db.get_recent_tiktoks_for_instagram(limit=PAGE_SIZE, offset=offset)
+    if not videos:
+        text = "✅ Усі TikTok-відео вже опубліковані в Instagram (або ще жодного немає)." if offset == 0 else "Більше немає."
+        return text, None
+
+    buttons = []
+    for v in videos:
+        caption_preview = (v.get("tiktok_caption") or "").strip().replace("\n", " ")[:36]
+        published = (v.get("tiktok_published_at") or "")[:16]
+        label = f"{published} · {caption_preview or 'без підпису'}"
+        buttons.append([InlineKeyboardButton(label[:64], callback_data=f"publish_ig:{v['id']}")])
+    if len(videos) == PAGE_SIZE:
+        buttons.append([InlineKeyboardButton("▶️ Показати ще", callback_data=f"ip_page:{offset + PAGE_SIZE}")])
+
+    count_label = f"(показано з {offset + 1})" if offset else f"{len(videos)}+" if len(videos) == PAGE_SIZE else str(len(videos))
+    return f"📋 Не опубліковано в Instagram {count_label}.\nОбери яке опублікувати:", InlineKeyboardMarkup(buttons)
+
+
+async def cmd_ig_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
+    text, markup = _build_ig_pending_page(0)
+    await update.message.reply_text(text, reply_markup=markup)
 
-    videos = db.get_recent_tiktoks_for_instagram(limit=15)
-    if not videos:
-        await update.message.reply_text(
-            "✅ Усі TikTok-відео вже опубліковані в Instagram (або ще жодного немає)."
-        )
+
+async def handle_ig_pending_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(update):
         return
-
-    await update.message.reply_text(
-        f"📋 Не опубліковано в Instagram: {len(videos)}.\n"
-        "Тапни цитату під кожним повідомленням нижче, щоб перейти до відео в чаті."
-    )
-
-    for v in videos:
-        caption_preview = (v.get("tiktok_caption") or "").strip().replace("\n", " ")[:120]
-        published = (v.get("tiktok_published_at") or "")[:16]
-        text = f"🎬 {published}\n{caption_preview or 'без підпису'}"
-        markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📸 Запостити в Instagram", callback_data=f"publish_ig:{v['id']}")
-        ]])
-        try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=text,
-                reply_markup=markup,
-                reply_to_message_id=v.get("message_id"),
-            )
-        except TgBadRequest:
-            # Оригінальне повідомлення видалене/недоступне — надсилаємо без reply.
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=text,
-                reply_markup=markup,
-            )
+    offset = int(query.data.split(":", 1)[1])
+    text, markup = _build_ig_pending_page(offset)
+    await query.edit_message_text(text, reply_markup=markup)
 
 
 def _build_tiktok_pending_page(offset: int) -> tuple:
@@ -1808,9 +1804,8 @@ async def _process_video_file(
             )
             s3_cover_url = upload_file(cover_for_part, prefix="covers")
 
-            # 7. Зберігаємо в БД (chat_id/message_id — щоб пізніше нагадування й
-            #    /ig_pending могли послатись на це повідомлення як reply, тобто
-            #    дати "перехід" до самого відео в чаті)
+            # 7. Зберігаємо в БД (chat_id/message_id — для нагадувань і
+            #    видалення тимчасових повідомлень пізніше в пайплайні)
             video_id = db.create_video(
                 original_filename=f"{original_name}{part_label}",
                 s3_url=s3_video_url,
@@ -2286,11 +2281,11 @@ async def _post_init(app: Application):
         BotCommand("queue", "Заплановані Instagram-каруселі"),
         BotCommand("tiktok_pending", "Оброблені відео, ще не відправлені в TikTok"),
         BotCommand("tiktok_sent", "Відео, вже відправлені в TikTok (є «відправити повторно»)"),
-        BotCommand("ig_pending", "TikTok-відео, ще не опубліковані в Instagram (з переходом у чат)"),
+        BotCommand("ig_pending", "TikTok-відео, ще не опубліковані в Instagram"),
         BotCommand("ig_sent", "Відео, вже опубліковані в Instagram (є «відправити повторно»)"),
         BotCommand("youtube_pending", "Відео в TikTok, ще не опубліковані в YouTube Shorts"),
         BotCommand("youtube_failed", "Відео з помилкою публікації в YouTube Shorts (є «спробувати ще раз»)"),
-        BotCommand("publish_ig", "Те саме, що ig_pending, одним списком з реальними переглядами TikTok"),
+        BotCommand("publish_ig", "Те саме, що ig_pending, але з реальними переглядами TikTok в підписах"),
         BotCommand("stats", "Перегляди/лайки/коменти TikTok + що варто запостити в Instagram"),
         BotCommand("failed_videos", "Відео, де обробка впала (є «спробувати ще раз»)"),
         BotCommand("test_ig", "Перевірка підключення до Instagram (нічого не публікує)"),
@@ -2341,6 +2336,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_publish_youtube_callback, pattern=r"^publish_yt:"))
     app.add_handler(CallbackQueryHandler(handle_retry_failed_callback, pattern=r"^retry_failed:"))
     app.add_handler(CallbackQueryHandler(handle_tiktok_pending_page_callback, pattern=r"^tp_page:"))
+    app.add_handler(CallbackQueryHandler(handle_ig_pending_page_callback, pattern=r"^ip_page:"))
     app.add_handler(CallbackQueryHandler(handle_tiktok_sent_page_callback, pattern=r"^ts_page:"))
     app.add_handler(CallbackQueryHandler(handle_ig_sent_page_callback, pattern=r"^is_page:"))
     app.add_handler(CallbackQueryHandler(handle_youtube_pending_page_callback, pattern=r"^yp_page:"))

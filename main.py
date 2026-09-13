@@ -18,6 +18,7 @@ Telegram бот — точка входу.
   /queue          — заплановані Instagram-каруселі (TikTok/Reels — повністю ручні, у черзі їх немає)
   /publish_ig     — те саме, що /ig_pending, але з реальними переглядами TikTok в підписах
   /nocap          — опублікувати карусель без підпису (пропустити крок підпису)
+  /cancel         — скасувати карусель, що очікує на підпис (видаляє слайди з S3)
   /cleanup_old    — видалити відео старіші за CLEANUP_MIN_AGE_DAYS днів (S3 +
                     база), З ПІДТВЕРДЖЕННЯМ кнопкою — ніколи автоматично
 
@@ -1392,6 +1393,37 @@ async def cmd_nocap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _delete_carousel(carousel_id: int) -> None:
+    """Видаляє слайди з S3 і сам запис каруселі — спільний код для /cancel
+    (стадія очікування підпису) і "❌ Скасувати" (стадія вибору часу).
+    Безпечно лише ДО постановки в чергу (publish_queue.carousel_id — FK на
+    carousels), тому обидва місця виклику — саме до enqueue_carousel."""
+    import json
+    carousel = db.get_carousel_by_id(carousel_id)
+    if not carousel:
+        return
+    for url in json.loads(carousel["image_urls"]):
+        try:
+            await asyncio.to_thread(delete_s3_file, url)
+        except Exception as e:
+            logger.warning(f"Не вдалось видалити слайд {url} з S3: {e}")
+    db.delete_carousel(carousel_id)
+
+
+async def cmd_cancel_carousel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cancel — скасовує карусель, що очікує на підпис (стадія одразу після
+    завантаження слайдів, до /nocap чи тексту підпису). Видаляє слайди з S3
+    і запис з бази — нічого й не встигло піти на публікацію."""
+    if not is_allowed(update):
+        return
+    carousel_id = context.chat_data.pop("pending_carousel_id", None)
+    if not carousel_id:
+        await update.message.reply_text("Немає каруселі, що очікує на підпис — нічого скасовувати.")
+        return
+    await _delete_carousel(carousel_id)
+    await update.message.reply_text(f"❌ Карусель #{carousel_id} скасовано, слайди видалено.")
+
+
 async def handle_carousel_caption_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Вільний текст обробляємо ЛИШЕ якщо є карусель, що очікує на підпис —
     інакше нічого не робимо (щоб не заважати іншим сценаріям бота)."""
@@ -1432,6 +1464,9 @@ def _build_carousel_schedule_keyboard(carousel_id: int) -> InlineKeyboardMarkup:
     buttons.append([InlineKeyboardButton(
         "🔴 Зараз", callback_data=f"schedule_carousel:{carousel_id}:now",
     )])
+    buttons.append([InlineKeyboardButton(
+        "❌ Скасувати карусель", callback_data=f"cancel_carousel:{carousel_id}",
+    )])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1459,6 +1494,21 @@ async def handle_carousel_schedule_callback(update: Update, context: ContextType
         f"✅ Карусель #{carousel_id} поставлено в чергу на {label}.\n"
         "Опублікується автоматично в Instagram — підтверджувати повторно не треба."
     )
+
+
+async def handle_cancel_carousel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка "❌ Скасувати карусель" на кроці вибору часу публікації —
+    видаляє слайди з S3 і запис каруселі (ще не в publish_queue на цьому
+    кроці, тож видаляти більше нічого не треба)."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_allowed(update):
+        return
+
+    carousel_id = int(query.data.split(":", 1)[1])
+    await _delete_carousel(carousel_id)
+    await query.edit_message_text(f"❌ Карусель #{carousel_id} скасовано, слайди видалено.")
 
 
 # ── Обробка відео ─────────────────────────────────────────────────────────────
@@ -2292,6 +2342,7 @@ async def _post_init(app: Application):
         BotCommand("scan_drive", "Перевірити нові відео в Google Drive"),
         BotCommand("process_url", "Обробити відео за посиланням (якщо файл >20MB)"),
         BotCommand("nocap", "Опублікувати карусель без підпису"),
+        BotCommand("cancel", "Скасувати карусель, що очікує на підпис"),
         BotCommand("dm_blast", "Розсилка в Instagram Direct"),
         BotCommand("cleanup_old", f"Видалити відео старіші за {CLEANUP_MIN_AGE_DAYS} днів (з S3 і бази, з підтвердженням)"),
     ])
@@ -2346,8 +2397,10 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_dm_blast_callback, pattern=r"^dm_blast_(confirm|cancel)$"))
     app.add_handler(CallbackQueryHandler(handle_cleanup_callback, pattern=r"^cleanup_(confirm|cancel)$"))
     app.add_handler(CommandHandler("nocap", cmd_nocap))
+    app.add_handler(CommandHandler("cancel", cmd_cancel_carousel))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_carousel_photos))
     app.add_handler(CallbackQueryHandler(handle_carousel_schedule_callback, pattern=r"^schedule_carousel:"))
+    app.add_handler(CallbackQueryHandler(handle_cancel_carousel_callback, pattern=r"^cancel_carousel:"))
     # Постійне меню кнопок — текстові мітки кнопок ловимо ДО вільного тексту
     # каруселі нижче, інакше натискання кнопки сприймалось би за підпис.
     app.add_handler(MessageHandler(filters.Text([BTN_TIKTOK_PENDING]), cmd_tiktok_pending))

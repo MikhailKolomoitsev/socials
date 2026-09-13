@@ -631,6 +631,14 @@ def set_carousel_caption(carousel_id: int, caption: str):
         conn.execute("UPDATE carousels SET caption=? WHERE id=?", (caption, carousel_id))
 
 
+def delete_carousel(carousel_id: int):
+    """Видаляє запис каруселі (main.py:cmd_cancel_carousel — скасування ДО
+    того, як обрано час публікації, тобто ще немає рядка в publish_queue,
+    FK на carousels якого інакше довелось би прибирати теж)."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM carousels WHERE id=?", (carousel_id,))
+
+
 def set_carousel_published(carousel_id: int, media_id: str):
     with get_conn() as conn:
         conn.execute(

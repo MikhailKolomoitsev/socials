@@ -11,6 +11,7 @@
 зі статичної INSTAGRAM_BUSINESS_ACCOUNT_ID.
 """
 
+import logging
 import time
 from datetime import datetime
 
@@ -21,6 +22,8 @@ from config import (
     INSTAGRAM_ACCESS_TOKEN,
     INSTAGRAM_BUSINESS_ACCOUNT_ID,
 )
+
+logger = logging.getLogger(__name__)
 
 GRAPH_URL = "https://graph.instagram.com/v23.0"
 
@@ -237,7 +240,7 @@ def _create_container(ig_user_id, access_token: str, video_url: str, caption: st
     return data["id"]
 
 
-def _wait_for_container(container_id: str, access_token: str, max_retries: int = 15):
+def _wait_for_container(container_id: str, access_token: str, max_retries: int = 40):
     """Чекає поки Instagram обробить відео.
 
     Можливі status_code: IN_PROGRESS, FINISHED, ERROR, EXPIRED (24 год без публікації).
@@ -265,6 +268,7 @@ def _wait_for_container(container_id: str, access_token: str, max_retries: int =
         resp.raise_for_status()
         data = resp.json()
         status = data.get("status_code")
+        logger.info(f"Instagram container {container_id}: {status} (спроба {attempt + 1}/{max_retries})")
 
         if status == "FINISHED":
             return

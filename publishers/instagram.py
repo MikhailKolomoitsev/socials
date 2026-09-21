@@ -242,15 +242,26 @@ def _wait_for_container(container_id: str, access_token: str, max_retries: int =
 
     Можливі status_code: IN_PROGRESS, FINISHED, ERROR, EXPIRED (24 год без публікації).
     """
+    network_errors = 0
     for attempt in range(max_retries):
-        resp = requests.get(
-            f"{GRAPH_URL}/{container_id}",
-            params={
-                "fields": "status_code,status",
-                "access_token": access_token,
-            },
-            timeout=15,
-        )
+        try:
+            resp = requests.get(
+                f"{GRAPH_URL}/{container_id}",
+                params={
+                    "fields": "status_code,status",
+                    "access_token": access_token,
+                },
+                timeout=30,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            # Разовий збій мережі/SSL-handshake до graph.instagram.com не має
+            # валити публікацію: контейнер уже створено й обробляється на боці Meta.
+            network_errors += 1
+            if network_errors >= 4:
+                raise
+            time.sleep(15)
+            continue
+        network_errors = 0
         resp.raise_for_status()
         data = resp.json()
         status = data.get("status_code")

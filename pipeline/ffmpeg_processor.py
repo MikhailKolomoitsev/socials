@@ -43,6 +43,7 @@ def to_standard_mp4(input_path: str) -> str:
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
         "-c:a", "aac", "-b:a", "128k",
         "-r", "30",
+        "-movflags", "+faststart",
         output_path,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -84,7 +85,7 @@ def remove_silence(input_path: str, silence_threshold: float = -35.0, min_silenc
     if not keep_segments or len(keep_segments) == 1 and keep_segments[0] == (0.0, duration):
         # Тиші не знайдено — просто копіюємо файл без перекодування.
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", input_path, "-c", "copy", output_path],
+            ["ffmpeg", "-y", "-i", input_path, "-c", "copy", "-movflags", "+faststart", output_path],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
@@ -144,6 +145,7 @@ def split_video(input_path: str, num_parts: int = 2) -> list:
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
             "-c:a", "aac", "-b:a", "128k",
             "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart",
             output_path,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -232,6 +234,7 @@ def _trim_and_concat(input_path: str, segments: list, output_path: str):
             "-f", "concat", "-safe", "0",
             "-i", concat_txt,
             "-c", "copy",
+            "-movflags", "+faststart",
             output_path,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -279,6 +282,7 @@ def normalize_vertical(input_path: str, width: int = 1080, height: int = 1920) -
         "-map", "[outv]", "-map", "0:a?",
         "-vcodec", "libx264", "-preset", "ultrafast", "-crf", "23",
         "-acodec", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
         output_path,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -336,6 +340,7 @@ def burn_subtitles(input_path: str, srt_path: str) -> str:
             vcodec="libx264",
             acodec="copy",
             crf=18,
+            movflags="+faststart",
         )
         .overwrite_output()
     )

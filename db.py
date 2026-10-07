@@ -419,13 +419,28 @@ def get_recent_tiktoks_for_instagram(limit: int = 10, offset: int = 0):
     return [dict(r) for r in rows]
 
 
+def get_unpublished_instagram_videos(limit: int = 15, offset: int = 0):
+    """ВСІ оброблені відео, ще не опубліковані в Instagram — незалежно від
+    того, чи їх уже відправлено в TikTok (список "Неопубліковані Reels").
+    Спершу відомі перегляди TikTok, далі — за часом (відправка в TikTok,
+    а якщо її не було — створення)."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM videos
+            WHERE instagram_media_id IS NULL
+            ORDER BY (tiktok_public_views IS NULL) ASC, tiktok_public_views DESC,
+                     COALESCE(tiktok_published_at, created_at) DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def count_pending_instagram_reels() -> int:
-    """Скільки TikTok-відео ще НЕ опубліковано в Instagram — для періодичного
+    """Скільки оброблених відео ще НЕ опубліковано в Instagram — для періодичного
     нагадування "обери рілс" (main.py:_ig_reminder_job)."""
     with get_conn() as conn:
         row = conn.execute("""
-            SELECT COUNT(*) as cnt FROM videos
-            WHERE tiktok_video_id IS NOT NULL AND instagram_media_id IS NULL
+            SELECT COUNT(*) as cnt FROM videos WHERE instagram_media_id IS NULL
         """).fetchone()
     return row["cnt"]
 

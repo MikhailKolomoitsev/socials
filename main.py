@@ -334,23 +334,23 @@ def _format_views(n: int) -> str:
 
 def _build_ig_pending_page(offset: int) -> tuple:
     """Повертає (text, markup) для сторінки "Неопубліковані Reels"
-    (tiktok_video_id IS NOT NULL, instagram_media_id IS NULL). Кнопка на
-    кожне — publish_ig:<id> (handle_publish_ig_callback).
+    (усі оброблені відео з instagram_media_id IS NULL, незалежно від
+    відправки в TikTok). Кнопка на кожне — publish_ig:<id> (handle_publish_ig_callback).
 
     Раніше /ig_pending надсилало КОЖНЕ відео окремим повідомленням-відповіддю
     на оригінал у чаті (щоб тапнути цитату й перестрибнути до відео) — при
     15 відео це 16 повідомлень підряд, засмічували чат. Тепер — один список
     кнопок, як і в усіх інших "*_pending" командах (/tiktok_pending,
     /youtube_pending)."""
-    videos = db.get_recent_tiktoks_for_instagram(limit=PAGE_SIZE, offset=offset)
+    videos = db.get_unpublished_instagram_videos(limit=PAGE_SIZE, offset=offset)
     if not videos:
-        text = "✅ Усі TikTok-відео вже опубліковані в Instagram (або ще жодного немає)." if offset == 0 else "Більше немає."
+        text = "✅ Усі оброблені відео вже опубліковані в Instagram (або ще жодного немає)." if offset == 0 else "Більше немає."
         return text, None
 
     buttons = []
     for v in videos:
         caption_preview = (v.get("tiktok_caption") or "").strip().replace("\n", " ")[:36]
-        published = (v.get("tiktok_published_at") or "")[:16]
+        published = (v.get("tiktok_published_at") or v.get("created_at") or "")[:16]
         label = f"{published} · {caption_preview or 'без підпису'}"
         buttons.append([InlineKeyboardButton(label[:64], callback_data=f"publish_ig:{v['id']}")])
     if len(videos) == PAGE_SIZE:
@@ -2026,6 +2026,19 @@ IG_REMINDER_MIN_DAYS = 3
 IG_REMINDER_KIND = "ig_choose_reel"
 
 
+async def _instagram_token_refresh_job(context: ContextTypes.DEFAULT_TYPE):
+    """Щодня викликає _get_valid_token_and_user_id — оновлює токен за 10 днів
+    до закінчення, навіть якщо в Instagram довго нічого не публікували."""
+    try:
+        await asyncio.to_thread(get_valid_token_and_user_id)
+    except Exception as e:
+        logger.error(f"Не вдалось оновити Instagram токен: {e}")
+        await context.bot.send_message(
+            chat_id=TELEGRAM_ALLOWED_USER_ID,
+            text=f"⚠️ Instagram токен не оновився: {e}\n\nПройди /auth/instagram/login заново.",
+        )
+
+
 async def _ig_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     last_sent = db.get_last_reminder_at(IG_REMINDER_KIND)
     if last_sent and (datetime.now() - last_sent) < timedelta(days=IG_REMINDER_MIN_DAYS):
@@ -2439,6 +2452,11 @@ def main():
     # Нагадування "обери контент для Instagram" — раз на ~3 дні (перевірка
     # щодня о 12:00 Києва, сам job вирішує чи вже минуло 3 дні й чи є що
     # показати — див. _ig_reminder_job).
+    app.job_queue.run_daily(
+        _instagram_token_refresh_job,
+        time=dt_time(hour=4, minute=0, tzinfo=_KYIV_TZ),
+        name="instagram_token_refresh",
+    )
     app.job_queue.run_daily(
         _ig_reminder_job,
         time=dt_time(hour=IG_REMINDER_HOUR_KYIV, minute=IG_REMINDER_MINUTE_KYIV, tzinfo=_KYIV_TZ),

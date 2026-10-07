@@ -13,7 +13,7 @@
 
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 
@@ -26,6 +26,7 @@ from config import (
 logger = logging.getLogger(__name__)
 
 GRAPH_URL = "https://graph.instagram.com/v23.0"
+TOKEN_REFRESH_BEFORE_EXPIRY = timedelta(days=10)
 
 
 def _get_valid_token_and_user_id():
@@ -49,12 +50,12 @@ def _get_valid_token_and_user_id():
         return INSTAGRAM_ACCESS_TOKEN, INSTAGRAM_BUSINESS_ACCOUNT_ID
 
     expires_at = datetime.fromisoformat(tokens["expires_at"])
-    if datetime.now() < expires_at:
+    if datetime.now() < expires_at - TOKEN_REFRESH_BEFORE_EXPIRY:
         return tokens["access_token"], tokens["ig_user_id"]
 
-    # Токен протермінований (або скоро протермінується) — оновлюємо.
-    # Long-lived токен можна оновити, поки він валідний; якщо він вже зовсім
-    # протух (>60 днів без оновлення) — доведеться пройти /auth/instagram/login заново.
+    # Оновлюємо ЗАЗДАЛЕГІДЬ: Instagram дозволяє refresh лише поки токен ще
+    # валідний — після закінчення (60 днів) refresh повертає code 190 і
+    # лишається тільки пройти /auth/instagram/login заново.
     resp = requests.get(
         "https://graph.instagram.com/refresh_access_token",
         params={

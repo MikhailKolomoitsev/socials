@@ -1812,7 +1812,10 @@ async def _process_video_file(
             # платформи); при будь-якій помилці просто None — без хука.
             if HOOK_ANIMATION_ENABLED:
                 await msg.edit_text("✨ Малюю анімований хук...")
-                hook_overlay = await asyncio.to_thread(build_hook_overlay, transcript)
+                hook_overlay = await asyncio.to_thread(
+                    build_hook_overlay, transcript, word_tuples, segments,
+                    await asyncio.to_thread(get_duration, vertical_path),
+                )
             for platform in ("tiktok", "instagram"):
                 await msg.edit_text(f"🎬 Накладаю субтитри ({platform})...")
                 ass_content = build_ass_for_style(word_tuples, segments, platform)
@@ -2210,7 +2213,10 @@ async def _process_drive_file(
         if transcript and transcript.strip():
             if HOOK_ANIMATION_ENABLED:
                 await msg.edit_text(f"✨ «{filename}» — малюю анімований хук...")
-                hook_overlay = await asyncio.to_thread(build_hook_overlay, transcript)
+                hook_overlay = await asyncio.to_thread(
+                    build_hook_overlay, transcript, word_tuples, segments,
+                    await asyncio.to_thread(get_duration, vertical_path),
+                )
             for platform in ("tiktok", "instagram"):
                 await msg.edit_text(f"🎬 «{filename}» — накладаю субтитри ({platform})...")
                 ass_content = build_ass_for_style(word_tuples, segments, platform)

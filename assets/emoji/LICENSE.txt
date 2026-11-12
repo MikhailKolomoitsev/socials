@@ -1,0 +1,3 @@
+Emoji graphics: Twemoji (https://github.com/jdecked/twemoji), copyright Twitter, Inc and
+other contributors, licensed under CC-BY 4.0 (https://creativecommons.org/licenses/by/4.0/).
+Converted from SVG to 256x256 PNG; used by pipeline/hook_animation.py.

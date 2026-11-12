@@ -303,10 +303,10 @@ def burn_subtitles(input_path: str, srt_path: str, hook_overlay: dict = None) ->
     Args:
         input_path: шлях до відео (після silence removal)
         srt_path: шлях до .srt файлу
-        hook_overlay: (опційно) dict з pipeline/hook_animation.build_hook_overlay —
-                   PNG-послідовність анімованої картки-хука на початку відео;
-                   накладається в тому ж проході, що й субтитри (без зайвого
-                   перекодування), під субтитрами.
+        hook_overlay: (опційно) список з pipeline/hook_animation.build_hook_overlay —
+                   PNG-послідовності анімованих карток-хуків (початок, ~10 с,
+                   кінець); накладаються в тому ж проході, що й субтитри
+                   (без зайвого перекодування), під субтитрами.
         font_size: розмір шрифту субтитрів; якщо None — рахується від
                    висоти відео (~ height/24, з розумними межами)
         font_color: колір тексту
@@ -333,18 +333,20 @@ def burn_subtitles(input_path: str, srt_path: str, hook_overlay: dict = None) ->
     escaped_fonts_dir = fonts_dir.replace("\\", "/").replace(":", "\\:")
 
     if hook_overlay:
-        # Два входи: відео + PNG-послідовність із прозорістю. eof_action=pass —
-        # після останнього кадру послідовності оверлей зникає (за замовчуванням
-        # лишався б останній кадр на все відео).
-        filter_complex = (
-            f"[0:v][1:v]overlay=x={hook_overlay['x']}:y={hook_overlay['y']}:eof_action=pass[ov];"
-            f"[ov]subtitles={escaped_srt}:fontsdir={escaped_fonts_dir}[outv]"
-        )
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", input_path,
-            "-framerate", str(hook_overlay["fps"]), "-i", hook_overlay["pattern"],
-            "-filter_complex", filter_complex,
+        # Кожен хук — окремий вхід: PNG-послідовність із прозорістю, зсунута у
+        # часі через -itsoffset (початок хука). eof_action=pass — після
+        # останнього кадру послідовності оверлей зникає. Оверлеї йдуть ланцюжком,
+        # субтитри — поверх усіх.
+        cmd = ["ffmpeg", "-y", "-i", input_path]
+        for o in hook_overlay:
+            cmd += ["-itsoffset", f"{o['start']:.3f}", "-framerate", str(o["fps"]), "-i", o["pattern"]]
+        parts, prev = [], "0:v"
+        for i, o in enumerate(hook_overlay, start=1):
+            parts.append(f"[{prev}][{i}:v]overlay=x={o['x']}:y={o['y']}:eof_action=pass[ov{i}]")
+            prev = f"ov{i}"
+        parts.append(f"[{prev}]subtitles={escaped_srt}:fontsdir={escaped_fonts_dir}[outv]")
+        cmd += [
+            "-filter_complex", ";".join(parts),
             "-map", "[outv]", "-map", "0:a?",
             "-c:v", "libx264", "-crf", "18", "-c:a", "copy",
             "-movflags", "+faststart",

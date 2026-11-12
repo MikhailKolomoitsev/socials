@@ -37,7 +37,7 @@ Telegram бот — точка входу.
      Instagram" (з нагадування, /ig_pending, /publish_ig, /stats або
      повторно з "📸 Опубліковані Reels"), ніколи автоматично
   6. Щодня о 13:00 за Києвом (18:00 за Балі) — нагадування, ЯКЩО сьогодні
-     опубліковано менше TIKTOK_DAILY_LIMIT тіктоків
+     ще не опубліковано Reels в Instagram (ціль — один на день)
   7. Раз на ~3 дні (якщо є що показати) — нагадування обрати TikTok-відео
      для Instagram Reels і/або довести до кінця незаплановану карусель
   8. Якщо пайплайн обробки впав — відео потрапляє у "⚠️ Невдалі відео" з
@@ -87,7 +87,7 @@ import db
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, TMP_DIR,
     TIKTOK_PUBLISH_TIMES, TIKTOK_DAILY_LIMIT, INSTAGRAM_PUBLISH_HOUR,
-    YOUTUBE_CLIENT_ID, CLEANUP_MIN_AGE_DAYS,
+    YOUTUBE_CLIENT_ID, YOUTUBE_PUBLISH_INTERVAL_MINUTES, CLEANUP_MIN_AGE_DAYS,
 )
 from pipeline.ffmpeg_processor import to_standard_mp4, remove_silence, normalize_vertical, burn_subtitles, extract_frame, has_audio_stream, get_duration, split_video
 from pipeline.transcriber import transcribe_words, build_ass_for_style, save_ass
@@ -643,13 +643,15 @@ async def handle_publish_youtube_callback(update: Update, context: ContextTypes.
     try:
         local_path = await asyncio.to_thread(_download_direct_url, video["s3_url"])
         title = video.get("tiktok_caption") or video.get("original_filename") or "Short"
+        publish_at = db.reserve_youtube_slot(video_id, YOUTUBE_PUBLISH_INTERVAL_MINUTES)
         yt_video_id = await asyncio.to_thread(
             youtube_publish_short, local_path, title, video.get("transcript") or "",
-            video.get("cover_s3_url"),
+            video.get("cover_s3_url"), publish_at,
         )
         db.set_youtube_published(video_id, yt_video_id)
-        await query.edit_message_text(f"✅ Опубліковано в YouTube Shorts: https://youtube.com/shorts/{yt_video_id}")
+        await query.edit_message_text("✅ " + _youtube_result_line(yt_video_id, publish_at).removeprefix("📺 "))
     except Exception as e:
+        db.clear_youtube_slot(video_id)
         logger.error(f"Помилка публікації в YouTube: {e}", exc_info=True)
         await query.edit_message_text(f"❌ Помилка публікації в YouTube: {e}")
     finally:
@@ -1668,6 +1670,15 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _youtube_result_line(yt_video_id: str, publish_at) -> str:
+    """Рядок для повідомлення: посилання + (якщо відкладено) час публікації за Києвом."""
+    link = f"https://youtube.com/shorts/{yt_video_id}"
+    if publish_at is None:
+        return f"📺 YouTube Shorts: {link}"
+    when = publish_at.astimezone(_KYIV_TZ).strftime("%d.%m %H:%M")
+    return f"📺 YouTube Shorts заплановано на {when} (Київ): {link}"
+
+
 async def _auto_publish_youtube(
     video_id: int, local_video_path: str, title: str, description: str, cover_source: str = None,
 ) -> tuple[str, bool]:
@@ -1689,12 +1700,16 @@ async def _auto_publish_youtube(
     if not YOUTUBE_CLIENT_ID:
         return "", False
     try:
+        # Слот у черзі: якщо багато відео завантажено підряд — кожне наступне
+        # публікується через YOUTUBE_PUBLISH_INTERVAL_MINUTES після попереднього.
+        publish_at = db.reserve_youtube_slot(video_id, YOUTUBE_PUBLISH_INTERVAL_MINUTES)
         yt_video_id = await asyncio.to_thread(
-            youtube_publish_short, local_video_path, title, description, cover_source,
+            youtube_publish_short, local_video_path, title, description, cover_source, publish_at,
         )
         db.set_youtube_published(video_id, yt_video_id)
-        return f"📺 YouTube Shorts: https://youtube.com/shorts/{yt_video_id}\n\n", False
+        return _youtube_result_line(yt_video_id, publish_at) + "\n\n", False
     except Exception as e:
+        db.clear_youtube_slot(video_id)
         logger.warning(f"YouTube publish failed: {e}", exc_info=True)
         return f"📺 YouTube: не вдалось опублікувати ({e})\n\n", True
 
@@ -1982,30 +1997,33 @@ def _next_kyiv_time(hour: int, minute: int = 0) -> tuple:
     return scheduled_at_utc, day_label
 
 
-# ── Щоденне нагадування "опублікуй тіктоки" ──────────────────────────────────
+# ── Щоденне нагадування "опублікуй Reels" ────────────────────────────────────
 #
 # 18:00 за Балі (UTC+8, без переведення стрілок) = 13:00 за Києвом — вечір на
 # Балі, робочий день в Україні/Європі, тож обидва часових пояси зручні.
-# Спрацьовує ЛИШЕ якщо сьогодні опубліковано менше TIKTOK_DAILY_LIMIT —
-# на відміну від scheduler/queue_runner.py:_send_tiktok_reminder (реактивне,
-# одразу після кожної окремої ручної відправки в чернетки).
+# Спрацьовує ЛИШЕ якщо сьогодні в Instagram ще не опубліковано жодного Reels
+# (ціль — один Reels на день, IG_REELS_DAILY_LIMIT).
 
 DAILY_REMINDER_HOUR_KYIV = 13
 DAILY_REMINDER_MINUTE_KYIV = 0
+IG_REELS_DAILY_LIMIT = 1
 
 
-async def _daily_tiktok_reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    published_today = db.count_tiktoks_today()
-    if published_today >= TIKTOK_DAILY_LIMIT:
+async def _daily_reels_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    published_today = db.count_reels_today()
+    if published_today >= IG_REELS_DAILY_LIMIT:
         return  # ціль на сьогодні вже досягнута — нагадувати нема про що
 
-    remaining = TIKTOK_DAILY_LIMIT - published_today
+    pending = db.count_pending_instagram_reels()
+    if not pending:
+        return  # нема що публікувати — нагадування не допоможе
+
     await context.bot.send_message(
         chat_id=TELEGRAM_ALLOWED_USER_ID,
         text=(
-            f"🔔 Нагадування: сьогодні опубліковано лише {published_today}/{TIKTOK_DAILY_LIMIT} "
-            f"тіктоків, ще потрібно щонайменше {remaining}.\n\n"
-            "Перевір «📋 Неопубліковані тіктоки» і відправ решту."
+            f"🔔 Нагадування: сьогодні ще не опубліковано Reels в Instagram "
+            f"({published_today}/{IG_REELS_DAILY_LIMIT}).\n\n"
+            f"Готових до публікації відео: {pending}. Обери одне в «{BTN_IG_PENDING}»."
         ),
         reply_markup=_main_menu_keyboard(),
     )
@@ -2439,11 +2457,11 @@ def main():
         )
         logger.info(f"Drive poller: перевірка кожні {DRIVE_POLL_INTERVAL}с.")
 
-    # Щоденне нагадування "опублікуй тіктоки" — 13:00 за Києвом (18:00 Балі)
+    # Щоденне нагадування "опублікуй Reels" — 13:00 за Києвом (18:00 Балі)
     app.job_queue.run_daily(
-        _daily_tiktok_reminder_job,
+        _daily_reels_reminder_job,
         time=dt_time(hour=DAILY_REMINDER_HOUR_KYIV, minute=DAILY_REMINDER_MINUTE_KYIV, tzinfo=_KYIV_TZ),
-        name="daily_tiktok_reminder",
+        name="daily_reels_reminder",
     )
     logger.info(
         f"Щоденне нагадування: {DAILY_REMINDER_HOUR_KYIV:02d}:{DAILY_REMINDER_MINUTE_KYIV:02d} за Києвом."

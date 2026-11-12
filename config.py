@@ -63,6 +63,10 @@ INSTAGRAM_REDIRECT_URI = os.getenv("INSTAGRAM_REDIRECT_URI")  # напр. https:
 YOUTUBE_CLIENT_ID = os.getenv("YOUTUBE_CLIENT_ID")
 YOUTUBE_CLIENT_SECRET = os.getenv("YOUTUBE_CLIENT_SECRET")
 YOUTUBE_REDIRECT_URI = os.getenv("YOUTUBE_REDIRECT_URI")  # напр. https://<railway-domain>/auth/youtube/callback
+# Мінімальний інтервал між публікаціями YouTube Shorts: якщо відео завантажено
+# багато одразу, кожне наступне ставиться в чергу (нативна відкладена
+# публікація YouTube через publishAt) з цим кроком, а не вилітає пачкою.
+YOUTUBE_PUBLISH_INTERVAL_MINUTES = int(os.getenv("YOUTUBE_PUBLISH_INTERVAL_MINUTES", "60"))
 
 # Логіка публікацій
 #

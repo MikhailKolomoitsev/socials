@@ -176,6 +176,10 @@ def _migrate(conn):
     # жодної кнопки немає, тож тут лише факт і час публікації.
     add_column_if_missing("videos", "youtube_video_id", "youtube_video_id TEXT")
     add_column_if_missing("videos", "youtube_published_at", "youtube_published_at TEXT")
+    # Слот публікації в YouTube (UTC, 'YYYY-MM-DD HH:MM:SS') — і для миттєвих,
+    # і для відкладених: за найпізнішим слотом рахується наступний
+    # (reserve_youtube_slot), щоб публікації йшли з інтервалом.
+    add_column_if_missing("videos", "youtube_scheduled_at", "youtube_scheduled_at TEXT")
 
     # publish_queue.video_id був NOT NULL у старій схемі — записи для
     # instagram_carousel мають video_id=NULL (замість цього carousel_id).
@@ -360,6 +364,55 @@ def set_youtube_published(video_id: int, youtube_video_id: str):
             "UPDATE videos SET youtube_video_id=?, youtube_published_at=datetime('now') WHERE id=?",
             (youtube_video_id, video_id),
         )
+
+
+YOUTUBE_SLOT_FMT = "%Y-%m-%d %H:%M:%S"
+# Якщо вільний слот не далі за це від "зараз" — публікуємо одразу (завантаження
+# відео саме триває хвилини, відкладати на кілька хвилин немає сенсу).
+YOUTUBE_IMMEDIATE_TOLERANCE_MINUTES = 5
+
+
+def reserve_youtube_slot(video_id: int, interval_minutes: int):
+    """
+    Атомарно резервує час публікації в YouTube для відео. Слот = найпізніший
+    уже зарезервований + interval_minutes, але не раніше "зараз". Якщо черги
+    нема (слот у межах кількох хвилин від зараз) — повертає None: публікуй
+    одразу (public). Інакше — datetime (UTC, aware) для publishAt.
+
+    BEGIN IMMEDIATE — щоб два відео, що обробляються одночасно, не отримали
+    той самий слот.
+    """
+    from datetime import timedelta, timezone
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT MAX(youtube_scheduled_at) AS last FROM videos WHERE id != ?", (video_id,)
+        ).fetchone()
+        slot = now
+        if row["last"]:
+            last = datetime.strptime(row["last"], YOUTUBE_SLOT_FMT).replace(tzinfo=timezone.utc)
+            slot = max(now, last + timedelta(minutes=interval_minutes))
+
+        immediate = slot <= now + timedelta(minutes=YOUTUBE_IMMEDIATE_TOLERANCE_MINUTES)
+        stored = now if immediate else slot
+        conn.execute(
+            "UPDATE videos SET youtube_scheduled_at=? WHERE id=?",
+            (stored.strftime(YOUTUBE_SLOT_FMT), video_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return None if immediate else slot
+
+
+def clear_youtube_slot(video_id: int):
+    """Знімає резервацію слота, якщо завантаження в YouTube не вдалось —
+    інакше невдале відео блокувало б слот у черзі."""
+    with get_conn() as conn:
+        conn.execute("UPDATE videos SET youtube_scheduled_at=NULL WHERE id=?", (video_id,))
 
 
 def update_cover(video_id: int, cover_s3_url: str):
@@ -729,6 +782,15 @@ def count_tiktoks_today() -> int:
         row = conn.execute("""
             SELECT COUNT(*) as cnt FROM videos
             WHERE date(tiktok_published_at) = date('now')
+        """).fetchone()
+    return row["cnt"]
+
+
+def count_reels_today() -> int:
+    with get_conn() as conn:
+        row = conn.execute("""
+            SELECT COUNT(*) as cnt FROM videos
+            WHERE date(instagram_published_at) = date('now')
         """).fetchone()
     return row["cnt"]
 

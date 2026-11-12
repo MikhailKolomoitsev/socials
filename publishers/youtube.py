@@ -106,7 +106,10 @@ def set_thumbnail(youtube, video_id: str, cover_source: str) -> None:
             os.remove(thumb_path)
 
 
-def publish_short(local_video_path: str, title: str, description: str = "", cover_source: str = None) -> str:
+def publish_short(
+    local_video_path: str, title: str, description: str = "", cover_source: str = None,
+    publish_at: datetime = None,
+) -> str:
     """
     Заливає локальний файл як YouTube Short (публічно, одразу).
 
@@ -123,6 +126,11 @@ def publish_short(local_video_path: str, title: str, description: str = "", cove
     після завантаження відео. Потребує каналу, верифікованого номером
     телефону в YouTube Studio, інакше Google поверне youtubeSignupRequired —
     саме відео при цьому все одно публікується.
+
+    publish_at (опційно, aware-datetime UTC) — відкладена публікація: відео
+    вантажиться одразу як private з status.publishAt, і YouTube саме робить
+    його публічним у цей час (черга з інтервалом, main.py/db.reserve_youtube_slot).
+    Без publish_at — public одразу.
 
     Returns:
         YouTube video ID (https://youtube.com/shorts/<id>)
@@ -146,10 +154,12 @@ def publish_short(local_video_path: str, title: str, description: str = "", cove
             "categoryId": "22",  # People & Blogs
         },
         "status": {
-            "privacyStatus": "public",
+            "privacyStatus": "private" if publish_at else "public",
             "selfDeclaredMadeForKids": False,
         },
     }
+    if publish_at:
+        body["status"]["publishAt"] = publish_at.strftime("%Y-%m-%dT%H:%M:%SZ")
     media = MediaFileUpload(local_video_path, mimetype="video/mp4", resumable=True)
 
     request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)

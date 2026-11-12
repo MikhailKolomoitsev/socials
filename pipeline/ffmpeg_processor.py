@@ -293,7 +293,7 @@ def normalize_vertical(input_path: str, width: int = 1080, height: int = 1920) -
     return output_path
 
 
-def burn_subtitles(input_path: str, srt_path: str) -> str:
+def burn_subtitles(input_path: str, srt_path: str, hook_overlay: dict = None) -> str:
     """
     Накладає субтитри на відео у "TikTok-стилі": жирний білий текст з
     товстою чорною обводкою й тінню (читається на будь-якому фоні),
@@ -303,6 +303,10 @@ def burn_subtitles(input_path: str, srt_path: str) -> str:
     Args:
         input_path: шлях до відео (після silence removal)
         srt_path: шлях до .srt файлу
+        hook_overlay: (опційно) dict з pipeline/hook_animation.build_hook_overlay —
+                   PNG-послідовність анімованої картки-хука на початку відео;
+                   накладається в тому ж проході, що й субтитри (без зайвого
+                   перекодування), під субтитрами.
         font_size: розмір шрифту субтитрів; якщо None — рахується від
                    висоти відео (~ height/24, з розумними межами)
         font_color: колір тексту
@@ -327,6 +331,30 @@ def burn_subtitles(input_path: str, srt_path: str) -> str:
     # Екрануємо шляхи для ffmpeg subtitles filter
     escaped_srt = srt_path.replace("\\", "/").replace(":", "\\:")
     escaped_fonts_dir = fonts_dir.replace("\\", "/").replace(":", "\\:")
+
+    if hook_overlay:
+        # Два входи: відео + PNG-послідовність із прозорістю. eof_action=pass —
+        # після останнього кадру послідовності оверлей зникає (за замовчуванням
+        # лишався б останній кадр на все відео).
+        filter_complex = (
+            f"[0:v][1:v]overlay=x={hook_overlay['x']}:y={hook_overlay['y']}:eof_action=pass[ov];"
+            f"[ov]subtitles={escaped_srt}:fontsdir={escaped_fonts_dir}[outv]"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-framerate", str(hook_overlay["fps"]), "-i", hook_overlay["pattern"],
+            "-filter_complex", filter_complex,
+            "-map", "[outv]", "-map", "0:a?",
+            "-c:v", "libx264", "-crf", "18", "-c:a", "copy",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            tail = "\n".join(result.stderr.strip().splitlines()[-15:])
+            raise RuntimeError(f"ffmpeg помилка (burn_subtitles + hook): {tail}")
+        return output_path
 
     # Стиль задано у самому ASS-файлі (генерується transcriber.py).
     # force_style не потрібен — це усуває проблему з некоректною інтерпретацією

@@ -97,3 +97,7 @@ CLEANUP_MIN_AGE_DAYS = int(os.getenv("CLEANUP_MIN_AGE_DAYS", "30"))
 # Локальні папки
 TMP_DIR = "/tmp/socials"
 os.makedirs(TMP_DIR, exist_ok=True)
+
+# Анімований схема-хук у перші секунди відео (pipeline/hook_animation.py).
+# HOOK_ANIMATION_ENABLED=0 у Railway Variables вимикає без редеплою коду.
+HOOK_ANIMATION_ENABLED = os.getenv("HOOK_ANIMATION_ENABLED", "1") != "0"

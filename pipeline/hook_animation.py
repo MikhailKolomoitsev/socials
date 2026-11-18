@@ -33,6 +33,7 @@ import uuid
 from PIL import Image, ImageDraw
 
 from config import TMP_DIR, OPENAI_API_KEY
+from pipeline.broll import _locate
 from pipeline.cover_generator import _load_font, _wrap
 
 logger = logging.getLogger(__name__)
@@ -86,17 +87,23 @@ _PLAN_SYSTEM = f"""\
 гіпнотерапія, особистісний ріст). Кожен хук — ОДНЕ емодзі + коротка фраза.
 
 Поверни ТІЛЬКИ валідний JSON (без markdown):
-{{"hooks": [{{"emoji": "💡", "text": "..."}}, {{"emoji": "🧠", "text": "..."}}, {{"emoji": "✅", "text": "..."}}]}}
+{{"hooks": [{{"emoji": "💡", "text": "...", "phrase": "..."}}, {{"emoji": "🧠", "text": "...", "phrase": "..."}}, {{"emoji": "✅", "text": "...", "phrase": "..."}}]}}
 
-Рівно 3 хуки, по порядку:
-1. ГОЛОВНА ДУМКА всього відео (з цього починається відео).
-2. Важлива теза з того, що звучить приблизно на 10-й секунді і трохи далі.
-3. ВИСНОВОК — те, до чого спікер підводить наприкінці.
+Рівно 3 хуки, по порядку. Картка з'являється В ТОЙ МОМЕНТ, коли спікер це
+каже, тож текст має збігатися з тим, що звучить саме тоді. Транскрипція
+розбита на три ЧАСТИНИ — кожен хук бери СУВОРО з відповідної частини:
+1. ЧАСТИНА 1 (початок) — головна думка, яку там озвучує спікер.
+2. ЧАСТИНА 2 (середина) — важлива окрема теза звідти.
+3. ЧАСТИНА 3 (кінець) — висновок звідти.
 
 Правила:
 - Мова — та сама, що в транскрипції.
 - text: максимум 7 слів (до 45 символів), без крапки в кінці, стисло й
-  зачіпко. НІЧОГО не вигадуй — лише те, що сказав спікер.
+  зачіпко. Використовуй слова самого спікера (скорочуй, не перефразовуй
+  своїми словами). НІЧОГО не вигадуй — лише те, що сказав спікер у цьому
+  місці.
+- phrase: 3-6 слів ПІДРЯД, дослівно скопійованих із транскрипції з того місця,
+  де спікер каже цю думку (потрібно, щоб знайти точний момент).
 - emoji: ОДНЕ, строго з цього списку, що підходить за змістом:
   {" ".join(EMOJI_FILES)}
 """
@@ -128,15 +135,35 @@ def _timed_text(word_tuples, segments, transcript: str) -> str:
     return "\n".join(f"[{int(t) // 60}:{int(t) % 60:02d}] {text}" for t, text in lines)
 
 
-def _plan_hooks(timed_transcript: str):
-    """Повертає список із до 3 dict {"emoji", "text"} або None."""
+def _sections_text(word_tuples, segments, transcript: str) -> str:
+    """Транскрипт у трьох частинах (початок ≤10 с / середина / останні ~15 с), щоб
+    кожен хук брався з правильного місця. Без пословних таймкодів — один блок."""
+    if not word_tuples:
+        return _timed_text(word_tuples, segments, transcript)
+    end = word_tuples[-1][2]
+    mid_lo, last_lo = 12.0, max(12.0, end - 15.0)
+    parts = [
+        ("ЧАСТИНА 1 (початок)", [t for t in word_tuples if t[1] < 10.0]),
+        ("ЧАСТИНА 2 (середина)", [t for t in word_tuples if mid_lo <= t[1] < last_lo]),
+        ("ЧАСТИНА 3 (кінець)", [t for t in word_tuples if t[1] >= last_lo]),
+    ]
+    out = []
+    for title, ws in parts:
+        if ws:
+            out.append(f"=== {title} ===\n{_timed_text(ws, None, '')}")
+    return "\n\n".join(out)
+
+
+def _plan_hooks(timed_transcript: str, word_tuples=None):
+    """Повертає список із до 3 dict {"emoji", "text", "anchor"} або None.
+    anchor — початок фрази, яку спікер каже в цей момент (секунди) або None."""
     if not OPENAI_API_KEY:
         return None
 
     from openai import OpenAI
     client = OpenAI(api_key=OPENAI_API_KEY)
     resp = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4o",
         messages=[
             {"role": "system", "content": _PLAN_SYSTEM},
             {"role": "user", "content": f"Транскрипція з таймкодами:\n\n{timed_transcript[:5000]}"},
@@ -150,7 +177,9 @@ def _plan_hooks(timed_transcript: str):
     for h in (data.get("hooks") or [])[:3]:
         text = str(h.get("text") or "").strip().rstrip(".")
         if text:
-            hooks.append({"emoji": _normalize_emoji(str(h.get("emoji") or "")), "text": text})
+            phrase = str(h.get("phrase") or "").strip()
+            anchor = _locate(phrase, word_tuples) if (phrase and word_tuples) else None
+            hooks.append({"emoji": _normalize_emoji(str(h.get("emoji") or "")), "text": text, "anchor": anchor})
     return hooks or None
 
 
@@ -159,16 +188,26 @@ def _normalize_emoji(ch: str) -> str:
     return ch if ch in EMOJI_FILES else DEFAULT_EMOJI
 
 
-def _schedule(duration: float, n_hooks: int) -> list:
-    """[(індекс_хука, початок_у_секундах)] — без накладань, зі зсувом від кінця."""
+ANCHOR_LEAD = 0.3             # картка з'являється трохи ДО слів спікера
+
+
+def _schedule(duration: float, hooks: list) -> list:
+    """[(індекс_хука, початок_у_секундах)] — без накладань. Початок прив'язаний до
+    моменту, коли спікер каже цю думку (anchor); якщо його не знайдено — старі
+    фіксовані позиції (0 с / 10 с / кінець)."""
+    last_start = duration - END_MARGIN - HOOK_DURATION
+    fixed = [0.0, MIDDLE_HOOK_AT, last_start]
     slots = []
     prev_end = -MIN_GAP
-    candidates = [(0, 0.0)]
-    if n_hooks > 1:
-        candidates.append((1, MIDDLE_HOOK_AT))
-    if n_hooks > 2:
-        candidates.append((2, duration - END_MARGIN - HOOK_DURATION))
-    for idx, start in candidates:
+    for idx, h in enumerate(hooks[:3]):
+        anchor = h.get("anchor")
+        if anchor is None:
+            start = fixed[idx]
+        else:
+            start = max(0.0, anchor - ANCHOR_LEAD)
+            if idx == 0 and start > 12.0:     # головна думка має бути на початку
+                start = 0.0
+            start = min(start, last_start)    # не вилазити за кінець
         if start < 0 or start + HOOK_DURATION > duration:
             continue
         if start < prev_end + MIN_GAP:
@@ -302,10 +341,10 @@ def build_hook_overlay(transcript: str, word_tuples, segments, duration: float):
 
     overlays = []
     try:
-        hooks = _plan_hooks(_timed_text(word_tuples, segments, transcript))
+        hooks = _plan_hooks(_sections_text(word_tuples, segments, transcript), word_tuples)
         if not hooks:
             return None
-        for idx, start in _schedule(duration, len(hooks)):
+        for idx, start in _schedule(duration, hooks):
             h = hooks[idx]
             logger.info(f"Hook {idx + 1} @ {start:.1f}s: {h['emoji']} «{h['text']}»")
             out_dir = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_hook{idx + 1}")

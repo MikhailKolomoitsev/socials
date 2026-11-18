@@ -101,3 +101,7 @@ os.makedirs(TMP_DIR, exist_ok=True)
 # Анімований схема-хук у перші секунди відео (pipeline/hook_animation.py).
 # HOOK_ANIMATION_ENABLED=0 у Railway Variables вимикає без редеплою коду.
 HOOK_ANIMATION_ENABLED = os.getenv("HOOK_ANIMATION_ENABLED", "1") != "0"
+
+# Анімовані AI-вставки на ключові ідеї в перших секундах (pipeline/broll.py;
+# fal.ai FLUX, ~1-2 картинки на відео). BROLL_ENABLED=0 вимикає без редеплою коду.
+BROLL_ENABLED = os.getenv("BROLL_ENABLED", "1") != "0"

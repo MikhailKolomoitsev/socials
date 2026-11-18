@@ -87,13 +87,14 @@ import db
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, TMP_DIR,
     TIKTOK_PUBLISH_TIMES, TIKTOK_DAILY_LIMIT, INSTAGRAM_PUBLISH_HOUR,
-    YOUTUBE_CLIENT_ID, YOUTUBE_PUBLISH_INTERVAL_MINUTES, CLEANUP_MIN_AGE_DAYS, HOOK_ANIMATION_ENABLED,
+    YOUTUBE_CLIENT_ID, YOUTUBE_PUBLISH_INTERVAL_MINUTES, CLEANUP_MIN_AGE_DAYS, HOOK_ANIMATION_ENABLED, BROLL_ENABLED,
 )
 from pipeline.ffmpeg_processor import to_standard_mp4, remove_silence, normalize_vertical, burn_subtitles, extract_frame, has_audio_stream, get_duration, split_video
 from pipeline.transcriber import transcribe_words, build_ass_for_style, save_ass
 from pipeline.cover_generator import generate_cover_ai as generate_cover, regenerate_cover_ai, add_part_label
 from pipeline.caption_generator import generate_caption
 from pipeline.hook_animation import build_hook_overlay, cleanup_hook_overlay
+from pipeline.broll import build_broll, cleanup_broll
 from pipeline.uploader import upload_file, delete_file as delete_s3_file
 from scheduler.queue_runner import run as queue_runner_run
 from webapp.server import start_in_background as start_webapp
@@ -1746,6 +1747,23 @@ def _schedule_error_message_deletion(job_queue, chat_id: int, message_id: int):
     )
 
 
+async def _build_overlays(transcript, word_tuples, segments, duration):
+    """Хуки (Pillow) і AI-вставки (GPT + FLUX + ffmpeg) будуються ПАРАЛЕЛЬНО —
+    вставки довше через очікування fal.ai. Повертає (hook_overlay, broll);
+    кожен — None, якщо вимкнено або не вдалось (пайплайн іде далі без них)."""
+    async def hooks():
+        if not HOOK_ANIMATION_ENABLED:
+            return None
+        return await asyncio.to_thread(build_hook_overlay, transcript, word_tuples, segments, duration)
+
+    async def inserts():
+        if not BROLL_ENABLED:
+            return None
+        return await asyncio.to_thread(build_broll, word_tuples, duration)
+
+    return tuple(await asyncio.gather(hooks(), inserts()))
+
+
 async def _process_video_file(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1772,6 +1790,7 @@ async def _process_video_file(
     tiktok_caption = None
     split_cleanup = []
     hook_overlay = None
+    broll = None
 
     try:
         # -1. Відео без звуку — пропускаємо повністю (не обробляємо, нікуди
@@ -1810,18 +1829,16 @@ async def _process_video_file(
         if transcript and transcript.strip():
             # Анімований схема-хук у перші секунди (один рендер на обидві
             # платформи); при будь-якій помилці просто None — без хука.
-            if HOOK_ANIMATION_ENABLED:
-                await msg.edit_text("✨ Малюю анімований хук...")
-                hook_overlay = await asyncio.to_thread(
-                    build_hook_overlay, transcript, word_tuples, segments,
-                    await asyncio.to_thread(get_duration, vertical_path),
-                )
+            if HOOK_ANIMATION_ENABLED or BROLL_ENABLED:
+                await msg.edit_text("✨ Малюю анімовані хуки й вставки...")
+                video_duration = await asyncio.to_thread(get_duration, vertical_path)
+                hook_overlay, broll = await _build_overlays(transcript, word_tuples, segments, video_duration)
             for platform in ("tiktok", "instagram"):
                 await msg.edit_text(f"🎬 Накладаю субтитри ({platform})...")
                 ass_content = build_ass_for_style(word_tuples, segments, platform)
                 ass_path = save_ass(ass_content)
                 ass_paths.append(ass_path)
-                final_video_paths[platform] = await asyncio.to_thread(burn_subtitles, vertical_path, ass_path, hook_overlay)
+                final_video_paths[platform] = await asyncio.to_thread(burn_subtitles, vertical_path, ass_path, hook_overlay, broll)
         else:
             await msg.edit_text("🎬 Мовлення не розпізнано — субтитри пропускаю...")
             final_video_paths["tiktok"] = vertical_path
@@ -1978,6 +1995,7 @@ async def _process_video_file(
             except Exception:
                 pass
         cleanup_hook_overlay(hook_overlay)
+        cleanup_broll(broll)
 
 
 _KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -2184,6 +2202,7 @@ async def _process_drive_file(
     tiktok_caption = None
     split_cleanup = []
     hook_overlay = None
+    broll = None
 
     try:
         # Відео без звуку — пропускаємо повністю, див. коментар у
@@ -2211,18 +2230,16 @@ async def _process_drive_file(
         # Окреме відео на TikTok і на Instagram (інший стиль субтитрів) —
         # див. коментар у _process_video_file вище.
         if transcript and transcript.strip():
-            if HOOK_ANIMATION_ENABLED:
-                await msg.edit_text(f"✨ «{filename}» — малюю анімований хук...")
-                hook_overlay = await asyncio.to_thread(
-                    build_hook_overlay, transcript, word_tuples, segments,
-                    await asyncio.to_thread(get_duration, vertical_path),
-                )
+            if HOOK_ANIMATION_ENABLED or BROLL_ENABLED:
+                await msg.edit_text(f"✨ «{filename}» — малюю анімовані хуки й вставки...")
+                video_duration = await asyncio.to_thread(get_duration, vertical_path)
+                hook_overlay, broll = await _build_overlays(transcript, word_tuples, segments, video_duration)
             for platform in ("tiktok", "instagram"):
                 await msg.edit_text(f"🎬 «{filename}» — накладаю субтитри ({platform})...")
                 ass_content = build_ass_for_style(word_tuples, segments, platform)
                 ass_path = await asyncio.to_thread(save_ass, ass_content)
                 ass_paths.append(ass_path)
-                final_video_paths[platform] = await asyncio.to_thread(burn_subtitles, vertical_path, ass_path, hook_overlay)
+                final_video_paths[platform] = await asyncio.to_thread(burn_subtitles, vertical_path, ass_path, hook_overlay, broll)
         else:
             final_video_paths["tiktok"] = vertical_path
             final_video_paths["instagram"] = vertical_path
@@ -2365,6 +2382,7 @@ async def _process_drive_file(
             except Exception:
                 pass
         cleanup_hook_overlay(hook_overlay)
+        cleanup_broll(broll)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

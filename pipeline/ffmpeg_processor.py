@@ -293,7 +293,7 @@ def normalize_vertical(input_path: str, width: int = 1080, height: int = 1920) -
     return output_path
 
 
-def burn_subtitles(input_path: str, srt_path: str, hook_overlay: dict = None) -> str:
+def burn_subtitles(input_path: str, srt_path: str, hook_overlay: list = None, broll: list = None) -> str:
     """
     Накладає субтитри на відео у "TikTok-стилі": жирний білий текст з
     товстою чорною обводкою й тінню (читається на будь-якому фоні),
@@ -307,6 +307,9 @@ def burn_subtitles(input_path: str, srt_path: str, hook_overlay: dict = None) ->
                    PNG-послідовності анімованих карток-хуків (початок, ~10 с,
                    кінець); накладаються в тому ж проході, що й субтитри
                    (без зайвого перекодування), під субтитрами.
+        broll: (опційно) список з pipeline/broll.build_broll — короткі повноекранні
+                   кліпи-образи на ключові слова; йдуть ПІД хуками й субтитрами,
+                   з плавним появленням/зникненням.
         font_size: розмір шрифту субтитрів; якщо None — рахується від
                    висоти відео (~ height/24, з розумними межами)
         font_color: колір тексту
@@ -332,18 +335,33 @@ def burn_subtitles(input_path: str, srt_path: str, hook_overlay: dict = None) ->
     escaped_srt = srt_path.replace("\\", "/").replace(":", "\\:")
     escaped_fonts_dir = fonts_dir.replace("\\", "/").replace(":", "\\:")
 
-    if hook_overlay:
-        # Кожен хук — окремий вхід: PNG-послідовність із прозорістю, зсунута у
-        # часі через -itsoffset (початок хука). eof_action=pass — після
-        # останнього кадру послідовності оверлей зникає. Оверлеї йдуть ланцюжком,
-        # субтитри — поверх усіх.
+    if hook_overlay or broll:
+        # Входи: 0 — відео; далі кліпи-вставки (b-roll), далі PNG-послідовності
+        # хуків (зсув у часі через -itsoffset). Ланцюжок оверлеїв: вставки →
+        # хуки → субтитри (субтитри завжди зверху). eof_action=pass — після
+        # кінця вставки/хука оверлей зникає.
         cmd = ["ffmpeg", "-y", "-i", input_path]
-        for o in hook_overlay:
+        parts, prev, idx = [], "0:v", 0
+
+        for b in broll or []:
+            idx += 1
+            cmd += ["-i", b["path"]]
+            d, fade = b["duration"], 0.25
+            parts.append(
+                f"[{idx}:v]format=yuva420p,"
+                f"fade=t=in:st=0:d={fade}:alpha=1,"
+                f"fade=t=out:st={d - fade:.2f}:d={fade}:alpha=1,"
+                f"setpts=PTS-STARTPTS+{b['start']:.3f}/TB[br{idx}]"
+            )
+            parts.append(f"[{prev}][br{idx}]overlay=x=0:y=0:eof_action=pass[ov{idx}]")
+            prev = f"ov{idx}"
+
+        for o in hook_overlay or []:
+            idx += 1
             cmd += ["-itsoffset", f"{o['start']:.3f}", "-framerate", str(o["fps"]), "-i", o["pattern"]]
-        parts, prev = [], "0:v"
-        for i, o in enumerate(hook_overlay, start=1):
-            parts.append(f"[{prev}][{i}:v]overlay=x={o['x']}:y={o['y']}:eof_action=pass[ov{i}]")
-            prev = f"ov{i}"
+            parts.append(f"[{prev}][{idx}:v]overlay=x={o['x']}:y={o['y']}:eof_action=pass[ov{idx}]")
+            prev = f"ov{idx}"
+
         parts.append(f"[{prev}]subtitles={escaped_srt}:fontsdir={escaped_fonts_dir}[outv]")
         cmd += [
             "-filter_complex", ";".join(parts),
@@ -355,7 +373,7 @@ def burn_subtitles(input_path: str, srt_path: str, hook_overlay: dict = None) ->
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             tail = "\n".join(result.stderr.strip().splitlines()[-15:])
-            raise RuntimeError(f"ffmpeg помилка (burn_subtitles + hook): {tail}")
+            raise RuntimeError(f"ffmpeg помилка (burn_subtitles + overlays): {tail}")
         return output_path
 
     # Стиль задано у самому ASS-файлі (генерується transcriber.py).

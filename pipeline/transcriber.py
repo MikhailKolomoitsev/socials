@@ -36,8 +36,13 @@ SUBTITLE_STYLES = {
         "margin_v": 500,
         "outline": 3,
         "shadow": 2,
-        "highlight_color": "&H00D7FF&",   # золотисто-жовтий (ASS BGR)
         "default_color": "&H00FFFFFF&",   # білий, alpha=00 (непрозорий)
+        # Базові кольори тексту чергуються групами по кілька слів (білий →
+        # м'який жовтий → м'який блакитний), ASS BGR.
+        "base_palette": ["&HFFFFFF&", "&HA8E9FF&", "&HFFF3BF&"],
+        # Ключове слово ("головна думка" чанка): зелений + трохи більший шрифт.
+        "key_color": "&H58D034&",
+        "key_scale": 115,                 # % від базового розміру
     },
     "instagram": {
         "font_name": "Montserrat ExtraBold",
@@ -45,8 +50,10 @@ SUBTITLE_STYLES = {
         "margin_v": 560,                  # трохи вище за TikTok
         "outline": 3,
         "shadow": 2,
-        "highlight_color": "&H6C30E1&",   # рожево-фіолетовий (Instagram-акцент), ASS BGR
         "default_color": "&H00FFFFFF&",
+        "base_palette": ["&HFFFFFF&", "&HE8D1FF&", "&HFFE4D6&"],  # білий → рожевий → блакитно-лавандовий
+        "key_color": "&H5CE37C&",         # трохи інший зелений, ніж у TikTok (антидублікат)
+        "key_scale": 118,
     },
 }
 
@@ -176,12 +183,14 @@ def _transcribe_assemblyai_words(video_path: str) -> tuple[list, list, str]:
 def _segments_to_ass(segments: list, style: dict) -> str:
     """Fallback: сегменти → ASS (коли word-level недоступний)."""
     chunks = []
+    cycle = _ColorCycle(style["base_palette"])
     for seg in segments:
         start = _field(seg, "start", 0) or 0
         end = _field(seg, "end", 0) or 0
         text = (_field(seg, "text", "") or "").strip()
         if text:
-            chunks.append((_render_chunk_text(text.split(), style), start, end))
+            parts = text.split()
+            chunks.append((_render_chunk_text(parts, style, cycle.next(len(parts))), start, end))
     return _chunks_to_ass(chunks, style)
 
 
@@ -210,8 +219,9 @@ def _word_tuples_to_ass(words: list, style: dict) -> str:
     if not words:
         return ""
     chunks_raw = _dynamic_chunks(words)
+    cycle = _ColorCycle(style["base_palette"])
     chunks = [
-        (_render_chunk_text([w[0] for w in ch], style), ch[0][1], ch[-1][2])
+        (_render_chunk_text([w[0] for w in ch], style, cycle.next(len(ch))), ch[0][1], ch[-1][2])
         for ch in chunks_raw
     ]
     return _chunks_to_ass(chunks, style)
@@ -277,27 +287,52 @@ def _pick_highlight_word(words: list) -> str | None:
     return max(candidates, key=lambda w: len(_strip_punct(w)))
 
 
-def _render_chunk_text(words: list, style: dict) -> str:
+def _render_chunk_text(words: list, style: dict, base_color: str = None) -> str:
     """
-    Формує ASS-текст чанка: ключове слово обгортається кольоровим тегом
-    {\\c...}, решта лишається білою (успадковує PrimaryColour зі стилю).
-    Колір виділення береться зі style — різний для кожної платформи.
+    Формує ASS-текст чанка:
+      - весь чанк фарбується базовим кольором групи (base_color — чергується
+        між групами в _ColorCycle, щоб субтитри не були суцільно білими);
+      - ключове слово ("головна думка" чанка) — зелене й трохи збільшене
+        (\\fscx/\\fscy), після нього колір і розмір повертаються до базових.
+    Колір і масштаб ключового слова беруться зі style — різні для кожної
+    платформи.
     """
     if not words:
         return ""
+    base = base_color or style["default_color"]
     highlight = _pick_highlight_word(words)
-    if highlight is None:
-        return " ".join(words)
 
     parts = []
     used = False
     for w in words:
-        if not used and w == highlight:
-            parts.append(f"{{\\c{style['highlight_color']}}}{w}{{\\c{style['default_color']}}}")
+        if highlight is not None and not used and w == highlight:
+            scale = style["key_scale"]
+            parts.append(
+                f"{{\\c{style['key_color']}\\fscx{scale}\\fscy{scale}}}{w}"
+                f"{{\\c{base}\\fscx100\\fscy100}}"
+            )
             used = True
         else:
             parts.append(w)
-    return " ".join(parts)
+    return f"{{\\c{base}}}" + " ".join(parts)
+
+
+class _ColorCycle:
+    """Віддає базовий колір для кожного наступного чанка: колір тримається
+    кілька слів (3-5), потім змінюється на наступний у палітрі."""
+
+    def __init__(self, palette: list):
+        self.palette = palette
+        self.index = 0
+        self.words_left = random.randint(3, 5)
+
+    def next(self, n_words: int) -> str:
+        color = self.palette[self.index % len(self.palette)]
+        self.words_left -= n_words
+        if self.words_left <= 0:
+            self.index += 1
+            self.words_left = random.randint(3, 5)
+        return color
 
 
 def _chunks_to_ass(chunks: list, style: dict) -> str:

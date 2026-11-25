@@ -355,7 +355,10 @@ def _build_ig_pending_page(offset: int) -> tuple:
         caption_preview = (v.get("tiktok_caption") or "").strip().replace("\n", " ")[:36]
         published = (v.get("tiktok_published_at") or v.get("created_at") or "")[:16]
         label = f"{published} · {caption_preview or 'без підпису'}"
-        buttons.append([InlineKeyboardButton(label[:64], callback_data=f"publish_ig:{v['id']}")])
+        buttons.append([
+            InlineKeyboardButton(label[:56], callback_data=f"publish_ig:{v['id']}"),
+            InlineKeyboardButton("🗑", callback_data=f"hide_ig:{v['id']}:{offset}"),
+        ])
     if len(videos) == PAGE_SIZE:
         buttons.append([InlineKeyboardButton("▶️ Показати ще", callback_data=f"ip_page:{offset + PAGE_SIZE}")])
 
@@ -368,6 +371,19 @@ async def cmd_ig_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text, markup = _build_ig_pending_page(0)
     await update.message.reply_text(text, reply_markup=markup)
+
+
+async def handle_hide_ig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🗑 біля рілса у "Неопубліковані Reels" (hide_ig:<id>:<offset>) — ховає його
+    зі списку й нагадувань та перемальовує поточну сторінку."""
+    query = update.callback_query
+    await query.answer("Прибрано зі списку")
+    if not is_allowed(update):
+        return
+    _, vid, off = query.data.split(":")
+    db.hide_instagram_video(int(vid))
+    text, markup = _build_ig_pending_page(int(off))
+    await query.edit_message_text(text, reply_markup=markup)
 
 
 async def handle_ig_pending_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2461,6 +2477,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_retry_failed_callback, pattern=r"^retry_failed:"))
     app.add_handler(CallbackQueryHandler(handle_tiktok_pending_page_callback, pattern=r"^tp_page:"))
     app.add_handler(CallbackQueryHandler(handle_ig_pending_page_callback, pattern=r"^ip_page:"))
+    app.add_handler(CallbackQueryHandler(handle_hide_ig_callback, pattern=r"^hide_ig:"))
     app.add_handler(CallbackQueryHandler(handle_tiktok_sent_page_callback, pattern=r"^ts_page:"))
     app.add_handler(CallbackQueryHandler(handle_ig_sent_page_callback, pattern=r"^is_page:"))
     app.add_handler(CallbackQueryHandler(handle_youtube_pending_page_callback, pattern=r"^yp_page:"))

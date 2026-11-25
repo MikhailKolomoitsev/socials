@@ -154,6 +154,7 @@ def _migrate(conn):
     # Лайки/коменти публічного TikTok-відео — для рекомендацій "це залетіло,
     # постав в Instagram" (див. main.py:cmd_stats).
     add_column_if_missing("videos", "tiktok_public_likes", "tiktok_public_likes INTEGER")
+    add_column_if_missing("videos", "instagram_hidden", "instagram_hidden INTEGER DEFAULT 0")
     add_column_if_missing("videos", "tiktok_public_comments", "tiktok_public_comments INTEGER")
 
     # instagram_carousel підтримка в черзі публікацій
@@ -480,7 +481,7 @@ def get_unpublished_instagram_videos(limit: int = 15, offset: int = 0):
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT * FROM videos
-            WHERE instagram_media_id IS NULL
+            WHERE instagram_media_id IS NULL AND COALESCE(instagram_hidden, 0) = 0
             ORDER BY (tiktok_public_views IS NULL) ASC, tiktok_public_views DESC,
                      COALESCE(tiktok_published_at, created_at) DESC
             LIMIT ? OFFSET ?
@@ -488,12 +489,20 @@ def get_unpublished_instagram_videos(limit: int = 15, offset: int = 0):
     return [dict(r) for r in rows]
 
 
+def hide_instagram_video(video_id: int) -> None:
+    """Ховає відео зі списку "Неопубліковані Reels" і з нагадувань (не видаляє
+    відео й не чіпає інші списки)."""
+    with get_conn() as conn:
+        conn.execute("UPDATE videos SET instagram_hidden=1 WHERE id=?", (video_id,))
+
+
 def count_pending_instagram_reels() -> int:
     """Скільки оброблених відео ще НЕ опубліковано в Instagram — для періодичного
     нагадування "обери рілс" (main.py:_ig_reminder_job)."""
     with get_conn() as conn:
         row = conn.execute("""
-            SELECT COUNT(*) as cnt FROM videos WHERE instagram_media_id IS NULL
+            SELECT COUNT(*) as cnt FROM videos
+            WHERE instagram_media_id IS NULL AND COALESCE(instagram_hidden, 0) = 0
         """).fetchone()
     return row["cnt"]
 

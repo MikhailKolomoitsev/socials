@@ -105,3 +105,7 @@ HOOK_ANIMATION_ENABLED = os.getenv("HOOK_ANIMATION_ENABLED", "1") != "0"
 # Анімовані AI-вставки на ключові ідеї в перших секундах (pipeline/broll.py;
 # fal.ai FLUX, ~1-2 картинки на відео). BROLL_ENABLED=0 вимикає без редеплою коду.
 BROLL_ENABLED = os.getenv("BROLL_ENABLED", "1") != "0"
+
+# Випадковий мінімальний колорит відео: тепліше/холодніше/без змін
+# (pipeline/color_grade.py). COLOR_GRADE_ENABLED=0 вимикає без редеплою коду.
+COLOR_GRADE_ENABLED = os.getenv("COLOR_GRADE_ENABLED", "1") != "0"

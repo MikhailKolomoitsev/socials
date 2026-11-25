@@ -293,7 +293,7 @@ def normalize_vertical(input_path: str, width: int = 1080, height: int = 1920) -
     return output_path
 
 
-def burn_subtitles(input_path: str, srt_path: str, hook_overlay: list = None, broll: list = None) -> str:
+def burn_subtitles(input_path: str, srt_path: str, hook_overlay: list = None, broll: list = None, color_grade: str = None) -> str:
     """
     Накладає субтитри на відео у "TikTok-стилі": жирний білий текст з
     товстою чорною обводкою й тінню (читається на будь-якому фоні),
@@ -310,6 +310,8 @@ def burn_subtitles(input_path: str, srt_path: str, hook_overlay: list = None, br
         broll: (опційно) список з pipeline/broll.build_broll — короткі повноекранні
                    кліпи-образи на ключові слова; йдуть ПІД хуками й субтитрами,
                    з плавним появленням/зникненням.
+        color_grade: (опційно) ffmpeg-фільтр колориту (pipeline/color_grade.py),
+                   накладається лише на кадр відео — до вставок/хуків/субтитрів.
         font_size: розмір шрифту субтитрів; якщо None — рахується від
                    висоти відео (~ height/24, з розумними межами)
         font_color: колір тексту
@@ -335,13 +337,16 @@ def burn_subtitles(input_path: str, srt_path: str, hook_overlay: list = None, br
     escaped_srt = srt_path.replace("\\", "/").replace(":", "\\:")
     escaped_fonts_dir = fonts_dir.replace("\\", "/").replace(":", "\\:")
 
-    if hook_overlay or broll:
+    if hook_overlay or broll or color_grade:
         # Входи: 0 — відео; далі кліпи-вставки (b-roll), далі PNG-послідовності
         # хуків (зсув у часі через -itsoffset). Ланцюжок оверлеїв: вставки →
         # хуки → субтитри (субтитри завжди зверху). eof_action=pass — після
         # кінця вставки/хука оверлей зникає.
         cmd = ["ffmpeg", "-y", "-i", input_path]
         parts, prev, idx = [], "0:v", 0
+        if color_grade:
+            parts.append(f"[0:v]{color_grade}[cg]")
+            prev = "cg"
 
         for b in broll or []:
             idx += 1

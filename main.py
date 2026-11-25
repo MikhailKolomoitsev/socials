@@ -89,6 +89,7 @@ from config import (
     TIKTOK_PUBLISH_TIMES, TIKTOK_DAILY_LIMIT, INSTAGRAM_PUBLISH_HOUR,
     YOUTUBE_CLIENT_ID, YOUTUBE_PUBLISH_INTERVAL_MINUTES, CLEANUP_MIN_AGE_DAYS, HOOK_ANIMATION_ENABLED, BROLL_ENABLED,
 )
+from pipeline.color_grade import pick_color_grade
 from pipeline.ffmpeg_processor import to_standard_mp4, remove_silence, normalize_vertical, burn_subtitles, extract_frame, has_audio_stream, get_duration, split_video
 from pipeline.transcriber import transcribe_words, build_ass_for_style, save_ass
 from pipeline.cover_generator import generate_cover_ai as generate_cover, regenerate_cover_ai, add_part_label
@@ -1833,12 +1834,14 @@ async def _process_video_file(
                 await msg.edit_text("✨ Малюю анімовані хуки й вставки...")
                 video_duration = await asyncio.to_thread(get_duration, vertical_path)
                 hook_overlay, broll = await _build_overlays(transcript, word_tuples, segments, video_duration)
+            grade_name, color_vf = pick_color_grade()
+            logger.info(f"Колорит відео: {grade_name}")
             for platform in ("tiktok", "instagram"):
                 await msg.edit_text(f"🎬 Накладаю субтитри ({platform})...")
                 ass_content = build_ass_for_style(word_tuples, segments, platform)
                 ass_path = save_ass(ass_content)
                 ass_paths.append(ass_path)
-                final_video_paths[platform] = await asyncio.to_thread(burn_subtitles, vertical_path, ass_path, hook_overlay, broll)
+                final_video_paths[platform] = await asyncio.to_thread(burn_subtitles, vertical_path, ass_path, hook_overlay, broll, color_vf)
         else:
             await msg.edit_text("🎬 Мовлення не розпізнано — субтитри пропускаю...")
             final_video_paths["tiktok"] = vertical_path
@@ -2234,12 +2237,14 @@ async def _process_drive_file(
                 await msg.edit_text(f"✨ «{filename}» — малюю анімовані хуки й вставки...")
                 video_duration = await asyncio.to_thread(get_duration, vertical_path)
                 hook_overlay, broll = await _build_overlays(transcript, word_tuples, segments, video_duration)
+            grade_name, color_vf = pick_color_grade()
+            logger.info(f"Колорит відео: {grade_name}")
             for platform in ("tiktok", "instagram"):
                 await msg.edit_text(f"🎬 «{filename}» — накладаю субтитри ({platform})...")
                 ass_content = build_ass_for_style(word_tuples, segments, platform)
                 ass_path = await asyncio.to_thread(save_ass, ass_content)
                 ass_paths.append(ass_path)
-                final_video_paths[platform] = await asyncio.to_thread(burn_subtitles, vertical_path, ass_path, hook_overlay, broll)
+                final_video_paths[platform] = await asyncio.to_thread(burn_subtitles, vertical_path, ass_path, hook_overlay, broll, color_vf)
         else:
             final_video_paths["tiktok"] = vertical_path
             final_video_paths["instagram"] = vertical_path

@@ -1736,7 +1736,7 @@ async def handle_drive_process_callback(update: Update, context: ContextTypes.DE
 
     try:
         local_path = await asyncio.to_thread(drive_download, file_id, filename)
-        mark_processed(file_id)
+        db.mark_drive_file(file_id, filename)
     except Exception as e:
         await msg.edit_text(f"❌ Помилка завантаження з Drive: {e}")
         return
@@ -2253,9 +2253,10 @@ async def _drive_poll_job(context: ContextTypes.DEFAULT_TYPE):
         if is_processing(file_id):
             continue
 
-        # 2. Вже є в БД по назві файлу — оброблялось раніше (навіть після рестарту)
-        if db.is_filename_known(filename):
-            logger.debug(f"Drive poller: «{filename}» вже в БД — пропускаємо")
+        # 2. Вже оброблялось раніше: за Drive ID (стійко до перейменування) або
+        # за назвою (відео, оброблені до появи drive_files)
+        if db.is_drive_file_seen(file_id) or db.is_filename_known(filename):
+            logger.debug(f"Drive poller: «{filename}» вже оброблено — пропускаємо")
             continue
 
         logger.info(f"Drive poller: нове відео «{filename}» ({size_mb} MB)")
@@ -2283,6 +2284,7 @@ async def _drive_poll_job(context: ContextTypes.DEFAULT_TYPE):
                 await msg.edit_text(f"❌ Не вдалось завантажити «{filename}» з Drive: {e}")
                 continue
 
+            db.mark_drive_file(file_id, filename)
             await _process_drive_file(context.application, chat_id, msg, local_path, filename, file_id)
         except Exception as e:
             # _process_drive_file сама ловить майже все — сюди потрапляють

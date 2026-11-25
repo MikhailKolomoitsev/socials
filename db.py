@@ -125,6 +125,12 @@ def init_db():
                 skipped_at TEXT DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS drive_files (
+                file_id TEXT PRIMARY KEY,      -- Google Drive file ID
+                name TEXT,
+                first_seen_at TEXT DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS cover_style_state (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 generation_count INTEGER NOT NULL DEFAULT 0
@@ -803,6 +809,23 @@ def mark_skipped(filename: str, reason: str):
         conn.execute(
             "INSERT INTO skipped_videos (original_filename, reason) VALUES (?, ?)",
             (filename, reason),
+        )
+
+
+def is_drive_file_seen(file_id: str) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM drive_files WHERE file_id = ? LIMIT 1",
+            (file_id,),
+        ).fetchone()
+    return row is not None
+
+
+def mark_drive_file(file_id: str, name: str):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO drive_files (file_id, name) VALUES (?, ?)",
+            (file_id, name),
         )
 
 

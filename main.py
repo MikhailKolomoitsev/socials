@@ -20,7 +20,9 @@ Telegram бот — точка входу.
   /nocap          — опублікувати карусель без підпису (пропустити крок підпису)
   /cancel         — скасувати карусель, що очікує на підпис (видаляє слайди з S3)
   /cleanup_old    — видалити відео старіші за CLEANUP_MIN_AGE_DAYS днів (S3 +
-                    база), З ПІДТВЕРДЖЕННЯМ кнопкою — ніколи автоматично
+                    база), З ПІДТВЕРДЖЕННЯМ кнопкою
+  /cleanup_published — видалити файли відео, вже опублікованих в Reels (з підтвердженням).
+                    Нові Reels чистяться самі одразу після публікації.
 
 Сценарій відео:
   1. Надсилаєш відео в чат
@@ -97,6 +99,7 @@ from pipeline.caption_generator import generate_caption
 from pipeline.hook_animation import build_hook_overlay, cleanup_hook_overlay
 from pipeline.broll import build_broll, cleanup_broll
 from pipeline.uploader import upload_file, delete_file as delete_s3_file
+from pipeline.media_cleanup import cleanup_after_reel, delete_video_files
 from scheduler.queue_runner import run as queue_runner_run
 from webapp.server import start_in_background as start_webapp
 from publishers.instagram import publish_reel, adapt_caption_for_instagram, get_valid_token_and_user_id, test_connection as ig_test_connection
@@ -655,6 +658,12 @@ async def handle_publish_youtube_callback(update: Update, context: ContextTypes.
     if video.get("youtube_video_id"):
         await query.edit_message_text("✅ Це відео вже опубліковано в YouTube.")
         return
+    if video.get("files_deleted_at"):
+        await query.edit_message_text(
+            "❌ Відеофайл уже видалено зі сховища після публікації в Reels — "
+            "опублікувати в YouTube з бота не вийде."
+        )
+        return
 
     await query.edit_message_text("⏳ Завантажую і публікую в YouTube Shorts...")
 
@@ -820,6 +829,12 @@ async def handle_publish_ig_callback(update: Update, context: ContextTypes.DEFAU
     if not video:
         await query.edit_message_text("❌ Відео не знайдено.")
         return
+    if video.get("files_deleted_at"):
+        await query.edit_message_text(
+            "❌ Відеофайл уже видалено зі сховища після першої публікації в Reels — "
+            "повторно відправити не можна."
+        )
+        return
     is_resend = bool(video.get("instagram_media_id"))
 
     await query.edit_message_text(
@@ -838,6 +853,8 @@ async def handle_publish_ig_callback(update: Update, context: ContextTypes.DEFAU
             cover_url=video.get("cover_s3_url"),
         )
         db.set_instagram_published(video_id, media_id, insta_caption)
+        # Reels — останній крок: файли відео більше не потрібні, прибираємо зі сховища
+        await asyncio.to_thread(cleanup_after_reel, video_id)
         prefix = "✅ ПОВТОРНО опубліковано" if is_resend else "✅ Опубліковано"
         await query.edit_message_text(f"{prefix} в Instagram Reels (media_id={media_id}).")
     except Exception as e:
@@ -936,6 +953,12 @@ async def handle_publish_tiktok_callback(update: Update, context: ContextTypes.D
     video = db.get_video_by_id(video_id)
     if not video:
         await query.edit_message_text("❌ Відео не знайдено.")
+        return
+    if video.get("files_deleted_at"):
+        await query.edit_message_text(
+            "❌ Відеофайл уже видалено зі сховища після публікації в Reels — "
+            "відправити в TikTok з бота не вийде."
+        )
         return
     is_resend = bool(video.get("tiktok_video_id"))
 
@@ -1286,6 +1309,75 @@ async def handle_cleanup_callback(update: Update, context: ContextTypes.DEFAULT_
             f"базі однаково прибрано — файл-сирота лишився в бакеті):\n{sample}"
         )
 
+    await query.edit_message_text(report)
+
+
+# ── Видалення файлів уже опублікованих Reels ─────────────────────────────────
+#
+# Нові Reels чистяться самі одразу після публікації (pipeline/media_cleanup.py).
+# /cleanup_published — одноразово прибирає файли тих, що були опубліковані ДО
+# цієї зміни (або чий автовидалення впало). Записи в БД і обкладинки лишаються.
+
+async def cmd_cleanup_published(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    videos = db.get_published_videos_with_files()
+    if not videos:
+        await update.message.reply_text("Немає опублікованих в Reels відео, чиї файли ще лежать у сховищі.")
+        return
+
+    context.user_data["cleanup_published_ids"] = [v["id"] for v in videos]
+    await update.message.reply_text(
+        f"🗑 Знайдено {len(videos)} відео, уже опублікованих в Instagram Reels, "
+        "чиї відеофайли ще лежать у сховищі.\n\n"
+        "⚠️ Відеофайли (TikTok- і Instagram-версії) буде видалено НАЗАВЖДИ. "
+        "Записи в базі, статистика та обкладинки лишаються. Повторно відправити "
+        "ці відео в TikTok/Instagram/YouTube з бота після цього не вийде.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"🗑 Так, видалити {len(videos)}", callback_data="cleanup_pub_confirm"),
+            InlineKeyboardButton("❌ Скасувати", callback_data="cleanup_pub_cancel"),
+        ]]),
+    )
+
+
+async def handle_cleanup_published_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_allowed(update):
+        return
+
+    if query.data == "cleanup_pub_cancel":
+        context.user_data.pop("cleanup_published_ids", None)
+        await query.edit_message_text("Скасовано — нічого не видалено.")
+        return
+
+    video_ids = context.user_data.pop("cleanup_published_ids", None)
+    if not video_ids:
+        await query.edit_message_text(
+            "❌ Список застарів (можливо, бот перезапустився) — почни знову /cleanup_published."
+        )
+        return
+
+    await query.edit_message_text(f"🗑 Видаляю файли {len(video_ids)} відео...")
+
+    cleaned = 0
+    errors = []
+    for vid in video_ids:
+        video = db.get_video_by_id(vid)
+        # Повторна перевірка: видаляємо лише те, що справді опубліковане в Reels
+        if not video or not video.get("instagram_media_id") or video.get("files_deleted_at"):
+            continue
+        _, errs = await asyncio.to_thread(delete_video_files, video)
+        if errs:
+            errors.extend(errs)
+        else:
+            cleaned += 1
+
+    report = f"✅ Видалено файли {cleaned} відео зі сховища."
+    if errors:
+        report += f"\n\n⚠️ {len(errors)} помилок (спробуй ще раз пізніше):\n" + "\n".join(errors[:5])
     await query.edit_message_text(report)
 
 
@@ -2434,6 +2526,7 @@ async def _post_init(app: Application):
         BotCommand("cancel", "Скасувати карусель, що очікує на підпис"),
         BotCommand("dm_blast", "Розсилка в Instagram Direct"),
         BotCommand("cleanup_old", f"Видалити відео старіші за {CLEANUP_MIN_AGE_DAYS} днів (з S3 і бази, з підтвердженням)"),
+        BotCommand("cleanup_published", "Видалити файли відео, вже опублікованих в Reels (з підтвердженням)"),
     ])
 
 
@@ -2466,6 +2559,7 @@ def main():
     app.add_handler(CommandHandler("test_ig", cmd_test_ig))
     app.add_handler(CommandHandler("dm_blast", cmd_dm_blast))
     app.add_handler(CommandHandler("cleanup_old", cmd_cleanup_old))
+    app.add_handler(CommandHandler("cleanup_published", cmd_cleanup_published))
     app.add_handler(CommandHandler("process_url", cmd_process_url))
     app.add_handler(CommandHandler("scan_drive", cmd_scan_drive))
     app.add_handler(CallbackQueryHandler(handle_drive_process_callback, pattern=r"^drive_process:"))
@@ -2486,6 +2580,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_failed_videos_page_callback, pattern=r"^fv_page:"))
     app.add_handler(CallbackQueryHandler(handle_dm_blast_callback, pattern=r"^dm_blast_(confirm|cancel)$"))
     app.add_handler(CallbackQueryHandler(handle_cleanup_callback, pattern=r"^cleanup_(confirm|cancel)$"))
+    app.add_handler(CallbackQueryHandler(handle_cleanup_published_callback, pattern=r"^cleanup_pub_(confirm|cancel)$"))
     app.add_handler(CommandHandler("nocap", cmd_nocap))
     app.add_handler(CommandHandler("cancel", cmd_cancel_carousel))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_carousel_photos))

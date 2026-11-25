@@ -165,6 +165,10 @@ def _migrate(conn):
     # різали охоплення. s3_url лишається TikTok-варіантом (як і раніше).
     add_column_if_missing("videos", "s3_url_instagram", "s3_url_instagram TEXT")
 
+    # Коли відеофайли (s3_url / s3_url_instagram) видалені зі сховища після
+    # публікації в Reels (pipeline/media_cleanup.py). Запис і обкладинка лишаються.
+    add_column_if_missing("videos", "files_deleted_at", "files_deleted_at TEXT")
+
     # chat_id/message_id оригінального відео в Telegram — щоб нагадування
     # "опублікуй це відео" (queue_runner, після TikTok-завантаження) і
     # /ig_pending могли надіслати reply на оригінальне повідомлення (тап на
@@ -529,6 +533,22 @@ def get_video_by_id(video_id: int) -> Optional[dict]:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
     return dict(row) if row else None
+
+
+def mark_files_deleted(video_id: int):
+    with get_conn() as conn:
+        conn.execute("UPDATE videos SET files_deleted_at=datetime('now') WHERE id=?", (video_id,))
+
+
+def get_published_videos_with_files() -> list:
+    """Відео, вже опубліковані в Reels, чиї відеофайли ще лежать у сховищі
+    (для /cleanup_published)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM videos WHERE instagram_media_id IS NOT NULL "
+            "AND files_deleted_at IS NULL ORDER BY created_at ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_videos_older_than(days: int) -> list:

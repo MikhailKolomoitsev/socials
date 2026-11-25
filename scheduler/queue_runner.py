@@ -14,6 +14,7 @@ import json
 
 import db
 from pipeline.caption_generator import generate_caption
+from pipeline.media_cleanup import cleanup_after_reel
 from publishers.instagram import publish_reel, publish_carousel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [QUEUE] %(message)s")
@@ -64,6 +65,7 @@ def _publish_instagram(item: dict):
     )
     db.set_instagram_published(item["video_id"], media_id, caption)
     logger.info(f"✅ Instagram опубліковано: {media_id}")
+    cleanup_after_reel(item["video_id"])
 
 
 def _publish_instagram_carousel(item: dict):

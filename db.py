@@ -477,6 +477,7 @@ def get_recent_tiktoks_for_instagram(limit: int = 10, offset: int = 0):
             SELECT * FROM videos
             WHERE tiktok_video_id IS NOT NULL
               AND instagram_media_id IS NULL
+              AND files_deleted_at IS NULL
             ORDER BY (tiktok_public_views IS NULL) ASC, tiktok_public_views DESC, tiktok_published_at DESC
             LIMIT ? OFFSET ?
         """, (limit, offset)).fetchall()
@@ -492,6 +493,7 @@ def get_unpublished_instagram_videos(limit: int = 15, offset: int = 0):
         rows = conn.execute("""
             SELECT * FROM videos
             WHERE instagram_media_id IS NULL AND COALESCE(instagram_hidden, 0) = 0
+              AND files_deleted_at IS NULL
             ORDER BY (tiktok_public_views IS NULL) ASC, tiktok_public_views DESC,
                      COALESCE(tiktok_published_at, created_at) DESC
             LIMIT ? OFFSET ?
@@ -513,6 +515,7 @@ def count_pending_instagram_reels() -> int:
         row = conn.execute("""
             SELECT COUNT(*) as cnt FROM videos
             WHERE instagram_media_id IS NULL AND COALESCE(instagram_hidden, 0) = 0
+              AND files_deleted_at IS NULL
         """).fetchone()
     return row["cnt"]
 
@@ -544,6 +547,16 @@ def get_video_by_id(video_id: int) -> Optional[dict]:
 def mark_files_deleted(video_id: int):
     with get_conn() as conn:
         conn.execute("UPDATE videos SET files_deleted_at=datetime('now') WHERE id=?", (video_id,))
+
+
+def get_videos_in_queues() -> list:
+    """Відео, що ще можуть стояти в чергах (файли не позначені видаленими й
+    не опубліковані в Reels) — для звірки з бакетом (/sync_bucket)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM videos WHERE files_deleted_at IS NULL AND instagram_media_id IS NULL"
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_published_videos_with_files() -> list:
@@ -632,7 +645,7 @@ def get_unpublished_tiktok_videos(limit: int = 15, offset: int = 0) -> list:
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT * FROM videos
-            WHERE tiktok_video_id IS NULL
+            WHERE tiktok_video_id IS NULL AND files_deleted_at IS NULL
             ORDER BY created_at DESC
             LIMIT ? OFFSET ?
         """, (limit, offset)).fetchall()
@@ -684,6 +697,7 @@ def get_unpublished_youtube_videos(limit: int = 15, offset: int = 0) -> list:
             SELECT * FROM videos
             WHERE youtube_video_id IS NULL
               AND tiktok_video_id IS NOT NULL
+              AND files_deleted_at IS NULL
             ORDER BY created_at DESC
             LIMIT ? OFFSET ?
         """, (limit, offset)).fetchall()

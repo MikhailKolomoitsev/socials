@@ -16,6 +16,7 @@ Telegram бот — точка входу.
   /start          — привітання, показує меню кнопок
   /status         — скільки відео опубліковано в TikTok сьогодні (з ліміту TIKTOK_DAILY_LIMIT)
   /queue          — заплановані Instagram-каруселі (TikTok/Reels — повністю ручні, у черзі їх немає)
+  /sync_bucket    — звірити черги з бакетом S3, прибрати відео без файлів
   /publish_ig     — те саме, що /ig_pending, але з реальними переглядами TikTok в підписах
   /nocap          — опублікувати карусель без підпису (пропустити крок підпису)
   /cancel         — скасувати карусель, що очікує на підпис (видаляє слайди з S3)
@@ -99,7 +100,7 @@ from pipeline.caption_generator import generate_caption
 from pipeline.hook_animation import build_hook_overlay, cleanup_hook_overlay
 from pipeline.broll import build_broll, cleanup_broll
 from pipeline.uploader import upload_file, delete_file as delete_s3_file
-from pipeline.media_cleanup import cleanup_after_reel, delete_video_files
+from pipeline.media_cleanup import cleanup_after_reel, delete_video_files, sync_with_bucket
 from scheduler.queue_runner import run as queue_runner_run
 from webapp.server import start_in_background as start_webapp
 from publishers.instagram import publish_reel, adapt_caption_for_instagram, get_valid_token_and_user_id, test_connection as ig_test_connection
@@ -355,13 +356,14 @@ def _build_ig_pending_page(offset: int) -> tuple:
 
     buttons = []
     for v in videos:
-        caption_preview = (v.get("tiktok_caption") or "").strip().replace("\n", " ")[:36]
-        published = (v.get("tiktok_published_at") or v.get("created_at") or "")[:16]
+        caption_preview = (v.get("tiktok_caption") or "").strip().replace("\n", " ")
+        raw = (v.get("tiktok_published_at") or v.get("created_at") or "")[:16]
+        # "2026-11-25 16:09" → "25.11 16:09" — коротше, щоб лишилось місце під назву
+        published = f"{raw[8:10]}.{raw[5:7]} {raw[11:16]}" if len(raw) >= 16 else raw
         label = f"{published} · {caption_preview or 'без підпису'}"
-        buttons.append([
-            InlineKeyboardButton(label[:56], callback_data=f"publish_ig:{v['id']}"),
-            InlineKeyboardButton("🗑", callback_data=f"hide_ig:{v['id']}:{offset}"),
-        ])
+        # Кнопка публікації — на весь рядок (повна назва), видалення — окремим рядком
+        buttons.append([InlineKeyboardButton(label[:64], callback_data=f"publish_ig:{v['id']}")])
+        buttons.append([InlineKeyboardButton("🗑 Прибрати зі списку", callback_data=f"hide_ig:{v['id']}:{offset}")])
     if len(videos) == PAGE_SIZE:
         buttons.append([InlineKeyboardButton("▶️ Показати ще", callback_data=f"ip_page:{offset + PAGE_SIZE}")])
 
@@ -369,9 +371,49 @@ def _build_ig_pending_page(offset: int) -> tuple:
     return f"📋 Не опубліковано в Instagram {count_label}.\nОбери яке опублікувати:", InlineKeyboardMarkup(buttons)
 
 
+_last_bucket_sync = 0.0
+
+
+async def _auto_sync_bucket():
+    """Тиха звірка з бакетом перед показом списків черги (не частіше, ніж раз
+    на 5 хв). Помилки ігноруємо — список просто покажеться як є."""
+    global _last_bucket_sync
+    import time
+    if time.time() - _last_bucket_sync < 300:
+        return
+    _last_bucket_sync = time.time()
+    try:
+        await asyncio.to_thread(sync_with_bucket)
+    except Exception as e:
+        logger.warning(f"Авто-звірка з бакетом не вдалась: {e}")
+
+
+async def cmd_sync_bucket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sync_bucket — звіряє черги з бакетом S3: відео без файлів прибираються зі списків."""
+    if not is_allowed(update):
+        return
+    msg = await update.message.reply_text("🔄 Звіряю черги з бакетом...")
+    try:
+        r = await asyncio.to_thread(sync_with_bucket)
+    except Exception as e:
+        await msg.edit_text(f"❌ Не вдалось звіритись з бакетом: {e}")
+        return
+    lines = [f"✅ Перевірено {r['checked']} відео в чергах, у бакеті є {r['kept']}."]
+    if r["missing"]:
+        lines.append(f"\n🗑 Прибрано зі списків (файлів уже немає в бакеті): {len(r['missing'])}")
+        for m in r["missing"][:20]:
+            lines.append(f"• #{m['id']} {m['caption'] or 'без підпису'}")
+        if len(r["missing"]) > 20:
+            lines.append(f"… і ще {len(r['missing']) - 20}")
+    else:
+        lines.append("Усі файли на місці — списки без змін.")
+    await msg.edit_text("\n".join(lines))
+
+
 async def cmd_ig_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
+    await _auto_sync_bucket()
     text, markup = _build_ig_pending_page(0)
     await update.message.reply_text(text, reply_markup=markup)
 
@@ -426,6 +468,7 @@ def _build_tiktok_pending_page(offset: int) -> tuple:
 async def cmd_tiktok_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
+    await _auto_sync_bucket()
     text, markup = _build_tiktok_pending_page(0)
     await update.message.reply_text(text, reply_markup=markup)
 
@@ -577,6 +620,7 @@ def _build_youtube_pending_page(offset: int) -> tuple:
 async def cmd_youtube_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
+    await _auto_sync_bucket()
     text, markup = _build_youtube_pending_page(0)
     await update.message.reply_text(text, reply_markup=markup)
 
@@ -2518,6 +2562,7 @@ async def _post_init(app: Application):
         BotCommand("ig_sent", "Відео, вже опубліковані в Instagram (є «відправити повторно»)"),
         BotCommand("youtube_pending", "Відео в TikTok, ще не опубліковані в YouTube Shorts"),
         BotCommand("youtube_failed", "Відео з помилкою публікації в YouTube Shorts (є «спробувати ще раз»)"),
+        BotCommand("sync_bucket", "Звірити черги з бакетом S3 і прибрати відео без файлів"),
         BotCommand("publish_ig", "Те саме, що ig_pending, але з реальними переглядами TikTok в підписах"),
         BotCommand("stats", "Перегляди/лайки/коменти TikTok + що варто запостити в Instagram"),
         BotCommand("failed_videos", "Відео, де обробка впала (є «спробувати ще раз»)"),
@@ -2551,6 +2596,7 @@ def main():
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("publish_ig", cmd_publish_ig))
     app.add_handler(CommandHandler("ig_pending", cmd_ig_pending))
+    app.add_handler(CommandHandler("sync_bucket", cmd_sync_bucket))
     app.add_handler(CommandHandler("ig_sent", cmd_ig_sent))
     app.add_handler(CommandHandler("youtube_pending", cmd_youtube_pending))
     app.add_handler(CommandHandler("youtube_failed", cmd_youtube_failed))

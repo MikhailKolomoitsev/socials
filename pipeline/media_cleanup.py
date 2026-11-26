@@ -14,7 +14,7 @@ Reels — останній крок життя відео (TikTok-чернетк
 import logging
 
 import db
-from pipeline.uploader import delete_file
+from pipeline.uploader import delete_file, key_from_url, list_all_keys
 
 logger = logging.getLogger(__name__)
 
@@ -55,3 +55,29 @@ def cleanup_after_reel(video_id: int) -> None:
             logger.info(f"🗑 Видалено {deleted} файл(ів) відео #{video_id} з S3 після публікації в Reels")
     except Exception as e:
         logger.warning(f"Автовидалення файлів відео #{video_id} не вдалось: {e}")
+
+
+def sync_with_bucket() -> dict:
+    """Звіряє черги з бакетом: відео, чиїх файлів (s3_url / s3_url_instagram)
+    уже немає в сховищі, позначаються files_deleted_at — і зникають зі списків
+    "Неопубліковані ..." (опублікувати їх однаково неможливо).
+
+    Один list_objects_v2 на весь бакет, а не head на кожне відео. Якщо
+    лістинг упав або повернув 0 ключів при непорожніх чергах — нічого не
+    чіпаємо (щоб збій/неправильний бакет не "видалив" усю чергу).
+
+    Повертає {"checked": N, "missing": [{"id", "caption"}], "kept": M}.
+    """
+    videos = db.get_videos_in_queues()
+    keys = list_all_keys()
+    if videos and not keys:
+        raise RuntimeError("Бакет повернув 0 файлів — схоже на збій доступу, чергу не змінено.")
+
+    missing = []
+    for v in videos:
+        v_keys = [key_from_url(u) for u in {v.get("s3_url"), v.get("s3_url_instagram")} if u]
+        v_keys = [k for k in v_keys if k]
+        if v_keys and any(k not in keys for k in v_keys):
+            db.mark_files_deleted(v["id"])
+            missing.append({"id": v["id"], "caption": (v.get("tiktok_caption") or "").strip().replace("\n", " ")[:40]})
+    return {"checked": len(videos), "missing": missing, "kept": len(videos) - len(missing)}

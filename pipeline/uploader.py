@@ -83,6 +83,47 @@ def delete_file(url: str):
     s3.delete_object(Bucket=S3_BUCKET, Key=key)
 
 
+def key_from_url(url: str):
+    """S3-ключ за публічним URL; None, якщо URL не з нашого бакета."""
+    if not url:
+        return None
+    base = S3_PUBLIC_BASE_URL.rstrip("/")
+    return url[len(base) + 1:] if url.startswith(base + "/") else None
+
+
+def list_all_keys() -> set:
+    """Усі ключі бакета одним проходом (list_objects_v2 з пагінацією)."""
+    keys = set()
+    paginator = get_s3_client().get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=S3_BUCKET):
+        for obj in page.get("Contents", []):
+            keys.add(obj["Key"])
+    return keys
+
+
+def public_url(key: str) -> str:
+    return f"{S3_PUBLIC_BASE_URL.rstrip('/')}/{key}"
+
+
+def presign_put(key: str, content_type: str, expires: int = 3600) -> str:
+    """Підписаний URL для прямого PUT-завантаження з телефона в сховище —
+    великі відео не проходять через наш сервер."""
+    return get_s3_client().generate_presigned_url(
+        "put_object",
+        Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": content_type},
+        ExpiresIn=expires,
+    )
+
+
+def download_key(key: str, dest_path: str) -> str:
+    get_s3_client().download_file(S3_BUCKET, key, dest_path)
+    return dest_path
+
+
+def delete_key(key: str) -> None:
+    get_s3_client().delete_object(Bucket=S3_BUCKET, Key=key)
+
+
 def _get_content_type(ext: str) -> str:
     types = {
         ".mp4": "video/mp4",

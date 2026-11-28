@@ -1,7 +1,7 @@
 """
 Генерація обкладинки для TikTok / Instagram Reels.
 
-Режими (COVER_MODE у env: "frame" — за замовчуванням, "flux" — старий):
+Режими (COVER_MODE у env: random — за замовчуванням, або frame / photo / flux):
   generate_cover_ai(transcript, frame_path)  — "frame" ("подкаст-стиль"):
       кадр із відео (ти в кадрі) + плашка-тег зліва зверху, золотий
       підзаголовок з рискою, великий заголовок (біле + золоте) знизу на
@@ -30,6 +30,7 @@ import io
 import json
 import logging
 import os
+import random
 import uuid
 
 import requests as http_requests
@@ -149,40 +150,59 @@ def regenerate_cover_ai(transcript: str, mood: str) -> str:
     локальний файл кадру давно видалений (обробка вже завершилась), тож при
     помилці просто піднімає виняток.
     """
-    hook_text, image_prompt = _plan_cover(transcript)
-    logger.info(f"Regen cover ({mood}): «{hook_text}» | prompt: {image_prompt[:80]}…")
+    _hook, image_prompt = _plan_cover(transcript)
+    plan = _plan_cover_text(transcript)
+    logger.info(f"Regen cover ({mood}): {plan} | prompt: {image_prompt[:80]}…")
     style_override = f"{MOOD_STYLES[mood]} {_BASE_STYLE}"
     bg = _fal_generate(image_prompt, style_override=style_override)
-    return _compose(bg, hook_text)
+    return _compose_cover(bg.resize((COVER_WIDTH, COVER_HEIGHT), Image.LANCZOS), plan)
 
 
 # ── Публічні функції ──────────────────────────────────────────────────────────
 
+def _pick_source(has_frame: bool) -> str:
+    """Звідки фон обкладинки: "frame" (кадр відео) / "photo" (твоє фото з
+    assets/photos) / "flux" (генерація fal.ai). COVER_MODE=random (за
+    замовчуванням) обирає навмання; можна примусово frame|photo|flux."""
+    mode = os.getenv("COVER_MODE", "random").lower()
+    if mode in ("frame", "photo", "flux"):
+        return mode if (mode != "frame" or has_frame) else "photo"
+    options = [("photo", 35), ("flux", 35)] + ([("frame", 30)] if has_frame else [])
+    return random.choices([o for o, _ in options], weights=[w for _, w in options])[0]
+
+
 def generate_cover_ai(transcript: str, frame_path: str) -> str:
     """
-    Генерує обкладинку. За замовчуванням ("frame") — подкаст-стиль на кадрі з
-    відео; при COVER_MODE=flux — старий шлях (fal.ai FLUX фон + hook зверху).
-    Будь-яка помилка → fallback на базову обкладинку з кадру.
+    Генерує обкладинку в "езотеричному подкаст-стилі": випадковий фон (кадр із
+    відео / твоє фото / FLUX) + тег, підзаголовок і градієнтний заголовок
+    (_plan_cover_text, _compose_cover). Будь-яка помилка → наступний варіант
+    фону, а зрештою — базова обкладинка з кадру.
     """
     if not OPENAI_API_KEY:
         logger.info("OPENAI_API_KEY не задано — frame fallback для обкладинки")
         return generate_cover(frame_path, subtitle_text=(transcript or "")[:60])
 
-    if os.getenv("COVER_MODE", "frame").lower() != "flux" and frame_path and os.path.exists(frame_path):
-        try:
-            plan = _plan_cover_text(transcript)
-            logger.info(f"Cover (frame): {plan}")
-            return _compose_frame(Image.open(frame_path).convert("RGB"), plan)
-        except Exception as e:
-            logger.warning(f"Frame-обкладинка не вдалась ({e}), пробую FLUX-режим", exc_info=True)
-
+    has_frame = bool(frame_path and os.path.exists(frame_path))
+    source = _pick_source(has_frame)
     try:
-        hook_text, image_prompt = _plan_cover(transcript)
-        logger.info(f"Cover hook: «{hook_text}» | prompt: {image_prompt[:80]}…")
-        bg = _fal_generate(image_prompt)
-        return _compose(bg, hook_text)
+        plan = _plan_cover_text(transcript)
+        logger.info(f"Cover [{source}]: {plan}")
+        if source == "flux":
+            try:
+                _hook, image_prompt = _plan_cover(transcript)
+                bg = _fal_generate(image_prompt)
+            except Exception as e:
+                logger.warning(f"FLUX-фон не вдався ({e}), беру фото")
+                source = "photo"
+        if source == "frame":
+            bg = _fit_cover(Image.open(frame_path).convert("RGB"), COVER_WIDTH, COVER_HEIGHT)
+        if source == "photo":
+            bg = _random_photo_background()
+        elif source == "flux":
+            bg = bg.resize((COVER_WIDTH, COVER_HEIGHT), Image.LANCZOS)
+        return _compose_cover(bg, plan)
     except Exception as e:
-        logger.warning(f"AI cover failed ({e}), using frame fallback")
+        logger.warning(f"AI cover failed ({e}), using frame fallback", exc_info=True)
         return generate_cover(frame_path, subtitle_text=(transcript or "")[:60])
 
 
@@ -437,10 +457,70 @@ def _compose(bg_image: Image.Image, hook_text: str) -> str:
 
 # ── "Подкаст-стиль": кадр із відео + інформативний текст ───────────────────────
 
-GOLD = (232, 197, 71)
 WHITE = (255, 255, 255)
-RED = (230, 40, 40)
-TAGS_HINT = "ПСИХОЛОГІЯ, ГІПНОТЕРАПІЯ, СТОСУНКИ, РОЗБІР, ІСТОРІЯ, ПОРАДА, ПІДКАСТ"
+
+# Езотеричні палітри: (колір підзаголовка/початок градієнта, кінець градієнта,
+# "біле" з відтінком, колір крапки в тегу). Одна випадкова на обкладинку.
+PALETTES = [
+    {"name": "amethyst",  "a": (190, 150, 255), "b": (255, 150, 215), "white": (247, 240, 255)},
+    {"name": "aurora",    "a": (120, 240, 215), "b": (150, 175, 255), "white": (238, 255, 252)},
+    {"name": "solar",     "a": (255, 214, 130), "b": (255, 150, 125), "white": (255, 248, 236)},
+    {"name": "moonlight", "a": (235, 228, 255), "b": (165, 190, 255), "white": (250, 250, 255)},
+    {"name": "emerald",   "a": (160, 240, 190), "b": (240, 220, 140), "white": (244, 255, 246)},
+]
+INK = (14, 8, 36)          # глибокий індиго замість чистого чорного (градієнти/тіні)
+
+# ── Твої фото як фон (assets/photos) ─────────────────────────────────────────
+# mode "cover" — кадрування під 9:16 із фокусом (fx, fy) — частки 0..1 точки,
+# яку лишаємо в центрі; mode "fit" — фото ціле (розмиті поля), напр. арт-мандала.
+PHOTOS_DIR = os.path.join(ASSETS_DIR, "photos")
+PHOTO_META = {
+    "flowers1.jpg":        {"mode": "cover", "fx": 0.38, "fy": 0.40},
+    "flowers2.jpg":        {"mode": "cover", "fx": 0.42, "fy": 0.40},
+    "mandala.jpg":         {"mode": "fit",   "y": 250},
+    "ring.jpg":            {"mode": "cover", "fx": 0.65, "fy": 0.50},
+    "gloves_sea.jpg":      {"mode": "cover", "fx": 0.45, "fy": 0.40},
+    "yellow_notebook.jpg": {"mode": "cover", "fx": 0.50, "fy": 0.40},
+    "yellow_portrait.jpg": {"mode": "cover", "fx": 0.45, "fy": 0.40},
+    "piano.jpg":           {"mode": "cover", "fx": 0.45, "fy": 0.40},
+}
+
+
+def _crop_to_916(img: Image.Image, fx: float, fy: float) -> Image.Image:
+    """Кадрує до 9:16 так, щоб точка фокусу (fx, fy) лишилась якомога ближче до центру."""
+    W, H = COVER_WIDTH, COVER_HEIGHT
+    ratio = W / H
+    if img.width / img.height > ratio:        # ширше за 9:16 — ріжемо боки
+        cw, ch = int(img.height * ratio), img.height
+    else:                                      # вужче — ріжемо верх/низ
+        cw, ch = img.width, int(img.width / ratio)
+    x0 = min(max(int(img.width * fx - cw / 2), 0), img.width - cw)
+    y0 = min(max(int(img.height * fy - ch / 2), 0), img.height - ch)
+    return img.crop((x0, y0, x0 + cw, y0 + ch)).resize((W, H), Image.LANCZOS)
+
+
+def _fit_with_blur(img: Image.Image, y: int) -> Image.Image:
+    """Ціле фото по ширині кадру, а поля — розмита й затемнена копія того ж фото."""
+    W, H = COVER_WIDTH, COVER_HEIGHT
+    bg = _fit_cover(img, W, H).filter(ImageFilter.GaussianBlur(38))
+    bg = Image.blend(bg, Image.new("RGB", (W, H), INK), 0.35)
+    fg = img.resize((W, int(img.height * W / img.width)), Image.LANCZOS)
+    bg.paste(fg, (0, y))
+    return bg
+
+
+def _random_photo_background() -> Image.Image:
+    names = [n for n in PHOTO_META if os.path.exists(os.path.join(PHOTOS_DIR, n))]
+    if not names:
+        raise RuntimeError("У assets/photos немає фото")
+    name = random.choice(names)
+    meta = PHOTO_META[name]
+    logger.info(f"Фон обкладинки: фото {name}")
+    img = Image.open(os.path.join(PHOTOS_DIR, name)).convert("RGB")
+    if meta["mode"] == "fit":
+        return _fit_with_blur(img, meta.get("y", 250))
+    return _crop_to_916(img, meta["fx"], meta["fy"])
+
 
 _PLAN_TEXT_SYSTEM = """\
 Ти робиш ТЕКСТ для обкладинки вертикального відео (психологія, гіпнотерапія,
@@ -508,25 +588,38 @@ def _draw_spaced(draw, xy, text, font, fill, spacing):
         x += draw.textlength(ch, font=font) + spacing
 
 
-def _compose_frame(frame: Image.Image, plan: dict) -> str:
+def _draw_gradient_text(layer: Image.Image, xy, text, font, c1, c2):
+    """Текст із горизонтальним градієнтом c1 → c2 (маска тексту × градієнт)."""
+    d = ImageDraw.Draw(layer)
+    bbox = d.textbbox((0, 0), text, font=font)
+    w, h = bbox[2] - bbox[0] + 8, bbox[3] + 8
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).text((0, 0), text, font=font, fill=255)
+    t = Image.linear_gradient("L").transpose(Image.ROTATE_90).resize((w, h))   # чорний→білий зліва направо
+    grad = Image.composite(Image.new("RGB", (w, h), c2), Image.new("RGB", (w, h), c1), t)
+    layer.paste(grad, (int(xy[0]), int(xy[1])), mask)
+
+
+def _compose_cover(bg_image: Image.Image, plan: dict) -> str:
     """
-    Подкаст-стиль: кадр з відео на весь 9:16, темний градієнт знизу, плашка-тег
-    (червона крапка) зліва зверху, золотий підзаголовок із рискою та великий
-    заголовок (біле + золоте). Увесь текст — у "безпечній зоні" (y 240-1680),
-    щоб лишався видимим і в сітці профілю (обрізка 3:4), і під інтерфейсом.
+    "Езотеричний подкаст-стиль": будь-який фон 1080×1920 (кадр відео / твоє
+    фото / FLUX) + глибокий індиго-градієнт знизу, плашка-тег зліва зверху,
+    підзаголовок із рискою та великий заголовок (відтінене біле + градієнт
+    палітри). Палітра випадкова (PALETTES). Увесь текст — у "безпечній зоні"
+    (y 240-1680): видно і в сітці профілю (обрізка 3:4), і під інтерфейсом.
     """
     W, H = COVER_WIDTH, COVER_HEIGHT
-    bg = _fit_cover(frame, W, H).convert("RGBA")
+    pal = random.choice(PALETTES)
+    bg = bg_image.resize((W, H), Image.LANCZOS).convert("RGBA")
 
-    # Градієнти: знизу (під заголовок) і трохи зверху (під тег)
     grad = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd = ImageDraw.Draw(grad)
-    g_top = 760
+    g_top = 740
     for y in range(g_top, H):
         t = (y - g_top) / (H - g_top)
-        gd.line([(0, y), (W, y)], fill=(0, 0, 0, int(238 * min(1.0, t ** 0.8 * 1.15))))
+        gd.line([(0, y), (W, y)], fill=INK + (int(240 * min(1.0, t ** 0.8 * 1.15)),))
     for y in range(0, 340):
-        gd.line([(0, y), (W, y)], fill=(0, 0, 0, int(110 * (1 - y / 340))))
+        gd.line([(0, y), (W, y)], fill=INK + (int(120 * (1 - y / 340)),))
     bg = Image.alpha_composite(bg, grad)
 
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -544,32 +637,34 @@ def _compose_frame(frame: Image.Image, plan: dict) -> str:
         size -= 4
     font = _load_font(size)
     line_h = int(size * 1.13)
-    block_h = line_h * len(plan["lines"])
     bottom = 1560
-    top = bottom - block_h
+    top = bottom - line_h * len(plan["lines"])
 
     for i, ln in enumerate(plan["lines"]):
         y = top + i * line_h
-        sd.text((margin_x + 3, y + 5), ln, font=font, fill=(0, 0, 0, 200))
-        d.text((margin_x, y), ln, font=font, fill=(GOLD if i in plan["accent"] else WHITE) + (255,))
+        sd.text((margin_x + 3, y + 5), ln, font=font, fill=(0, 0, 0, 210))
+        if i in plan["accent"]:
+            _draw_gradient_text(layer, (margin_x, y), ln, font, pal["a"], pal["b"])
+        else:
+            d.text((margin_x, y), ln, font=font, fill=pal["white"] + (255,))
 
-    # ── Підзаголовок (золотий, з рискою під ним) ─────────────────────────────
+    # ── Підзаголовок (колір палітри, з рискою під ним) ───────────────────────
     if plan.get("kicker"):
         kfont = _load_font(40)
         ky = top - 36 - 56
-        sd.text((margin_x + 2, ky + 3), plan["kicker"], font=kfont, fill=(0, 0, 0, 180))
-        _draw_spaced(d, (margin_x, ky), plan["kicker"], kfont, GOLD + (255,), 3)
-        d.rectangle([margin_x, ky + 58, margin_x + 78, ky + 64], fill=GOLD + (255,))
+        sd.text((margin_x + 2, ky + 3), plan["kicker"], font=kfont, fill=(0, 0, 0, 190))
+        _draw_spaced(d, (margin_x, ky), plan["kicker"], kfont, pal["a"] + (255,), 3)
+        d.rectangle([margin_x, ky + 58, margin_x + 78, ky + 64], fill=pal["b"] + (255,))
 
-    # ── Плашка-тег зліва зверху (біла, червона крапка) ───────────────────────
+    # ── Плашка-тег зліва зверху (світла, крапка кольору палітри) ─────────────
     if plan.get("tag"):
         tfont = _load_font(34)
         tw = _text_w(d, plan["tag"], tfont, 2)
         x0, y0, pad_x, h = 48, 262, 24, 62
         w = pad_x + 22 + 14 + tw + pad_x
-        d.rounded_rectangle([x0, y0, x0 + w, y0 + h], radius=h // 2, fill=(255, 255, 255, 245))
-        d.ellipse([x0 + pad_x, y0 + h // 2 - 11, x0 + pad_x + 22, y0 + h // 2 + 11], fill=RED + (255,))
-        _draw_spaced(d, (x0 + pad_x + 36, y0 + 11), plan["tag"], tfont, (15, 15, 15, 255), 2)
+        d.rounded_rectangle([x0, y0, x0 + w, y0 + h], radius=h // 2, fill=pal["white"] + (242,))
+        d.ellipse([x0 + pad_x, y0 + h // 2 - 11, x0 + pad_x + 22, y0 + h // 2 + 11], fill=pal["b"] + (255,))
+        _draw_spaced(d, (x0 + pad_x + 36, y0 + 11), plan["tag"], tfont, INK + (255,), 2)
 
     shadow = shadow.filter(ImageFilter.GaussianBlur(7))
     bg = Image.alpha_composite(bg, shadow)
@@ -582,7 +677,7 @@ def _compose_frame(frame: Image.Image, plan: dict) -> str:
         except Exception as e:
             logger.warning(f"Не вдалось завантажити логотип: {e}")
 
-    out = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_cover_frame.jpg")
+    out = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_cover_ai.jpg")
     bg.convert("RGB").save(out, "JPEG", quality=95)
     return out
 

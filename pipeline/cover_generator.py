@@ -1,8 +1,15 @@
 """
 Генерація обкладинки для TikTok / Instagram Reels.
 
-Два режими:
-  generate_cover_ai(transcript, frame_path)  — основний:
+Режими (COVER_MODE у env: "frame" — за замовчуванням, "flux" — старий):
+  generate_cover_ai(transcript, frame_path)  — "frame" ("подкаст-стиль"):
+      кадр із відео (ти в кадрі) + плашка-тег зліва зверху, золотий
+      підзаголовок з рискою, великий заголовок (біле + золоте) знизу на
+      темному градієнті. Текст — інформативна зачіпка від GPT-4o
+      (pipeline/cover_generator.py:_plan_cover_text, _compose_frame).
+      Якщо кадру/ключа немає чи щось падає — спрацьовує старий шлях нижче.
+
+  Старий режим "flux" / регенерація за настроєм:
       1. GPT-4o витягує hook-текст (коротке питання або удар) + опис сцени
       2. fal.ai FLUX генерує теплий, світлий, шамансько-балійський
          медитативний фон (природа/ритуальні предмети — НЕ темний/похмурий,
@@ -26,7 +33,7 @@ import os
 import uuid
 
 import requests as http_requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 import db
 from config import TMP_DIR, OPENAI_API_KEY, FAL_KEY
@@ -153,16 +160,21 @@ def regenerate_cover_ai(transcript: str, mood: str) -> str:
 
 def generate_cover_ai(transcript: str, frame_path: str) -> str:
     """
-    Генерує AI-обкладинку: fal.ai FLUX фон + hook зверху + логотип.
-    При помилці — fallback на кадр з відео.
-
-    Пріоритет генератора зображень:
-      1. fal.ai FLUX (FAL_KEY) — висока якість, нативний 9:16, ~$0.003-0.006/зображення
-      2. Fallback: кадр з відео з текстом (без AI зображення)
+    Генерує обкладинку. За замовчуванням ("frame") — подкаст-стиль на кадрі з
+    відео; при COVER_MODE=flux — старий шлях (fal.ai FLUX фон + hook зверху).
+    Будь-яка помилка → fallback на базову обкладинку з кадру.
     """
     if not OPENAI_API_KEY:
         logger.info("OPENAI_API_KEY не задано — frame fallback для обкладинки")
         return generate_cover(frame_path, subtitle_text=(transcript or "")[:60])
+
+    if os.getenv("COVER_MODE", "frame").lower() != "flux" and frame_path and os.path.exists(frame_path):
+        try:
+            plan = _plan_cover_text(transcript)
+            logger.info(f"Cover (frame): {plan}")
+            return _compose_frame(Image.open(frame_path).convert("RGB"), plan)
+        except Exception as e:
+            logger.warning(f"Frame-обкладинка не вдалась ({e}), пробую FLUX-режим", exc_info=True)
 
     try:
         hook_text, image_prompt = _plan_cover(transcript)
@@ -419,6 +431,158 @@ def _compose(bg_image: Image.Image, hook_text: str) -> str:
             logger.warning(f"Не вдалось завантажити логотип: {e}")
 
     out = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_cover_ai.jpg")
+    bg.convert("RGB").save(out, "JPEG", quality=95)
+    return out
+
+
+# ── "Подкаст-стиль": кадр із відео + інформативний текст ───────────────────────
+
+GOLD = (232, 197, 71)
+WHITE = (255, 255, 255)
+RED = (230, 40, 40)
+TAGS_HINT = "ПСИХОЛОГІЯ, ГІПНОТЕРАПІЯ, СТОСУНКИ, РОЗБІР, ІСТОРІЯ, ПОРАДА, ПІДКАСТ"
+
+_PLAN_TEXT_SYSTEM = """\
+Ти робиш ТЕКСТ для обкладинки вертикального відео (психологія, гіпнотерапія,
+стосунки, особистісний ріст) у стилі сильних подкаст-обкладинок: людина в
+кадрі + плашка-тег + підзаголовок + великий заголовок. Обкладинка має
+ЗМУШУВАТИ відкрити відео: конкретика, інтрига, обіцянка, особиста історія.
+
+Поверни ТІЛЬКИ валідний JSON (без markdown):
+{"tag": "...", "kicker": "...", "lines": ["...", "..."], "accent": [1]}
+
+- tag: ОДНЕ слово ВЕЛИКИМИ — рубрика (напр. ПСИХОЛОГІЯ, ГІПНОТЕРАПІЯ,
+  СТОСУНКИ, РОЗБІР, ІСТОРІЯ, ПОРАДА, ПІДКАСТ). Обери за змістом відео.
+- kicker: 2-4 слова ВЕЛИКИМИ над заголовком — інтрига/контекст/цифра, що
+  додає інформації, а не повторює заголовок. Напр. "УСЕ ВСЕРЕДИНІ",
+  "ТРИ РІВНІ", "16 ГОДИН ПЕРЕЛЬОТУ", "ДОВГОСТРОКОВА СТРАТЕГІЯ".
+- lines: заголовок, 2-3 рядки ВЕЛИКИМИ, разом до 9 слів, кожен рядок до ~16
+  символів (рядки коротші за 18 символів!). Це головна зачіпка: що саме
+  дізнається глядач / чого не знає / яка несподівана теза чи історія.
+  Приклади стилю: ["НЕ ТРЕБА", "ШУКАТИ СЕБЕ"]; ["МОЄ «ХОЧУ»", "ЧИ «ТРЕБА»", "СУСПІЛЬСТВА?"];
+  ["ВІРЮ. ЗНАЮ.", "ПРОЖИВАЮ"]; ["ЗАЛИШИВ ДІВЧИНУ", "І ПОЛЕТІВ", "НА БАЛІ"].
+- accent: індекси рядків (з 0), які будуть ЗОЛОТИМИ — найсильніша частина
+  заголовка (зазвичай останній рядок). Решта — білі.
+- Мова — та сама, що в транскрипції. Ніяких фактів, яких немає в
+  транскрипції; ніякого брехливого клікбейту; без крапки в кінці.
+"""
+
+
+def _plan_cover_text(transcript: str) -> dict:
+    """GPT-4o → {"tag", "kicker", "lines": [...], "accent": [...]} (нормалізоване)."""
+    from openai import OpenAI
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": _PLAN_TEXT_SYSTEM},
+            {"role": "user", "content": f"Транскрипція:\n\n{(transcript or '')[:2500]}"},
+        ],
+        temperature=0.8,
+        max_tokens=300,
+        response_format={"type": "json_object"},
+    )
+    data = json.loads(resp.choices[0].message.content)
+    lines = [str(l).strip().upper().rstrip(".") for l in (data.get("lines") or []) if str(l).strip()][:3]
+    if not lines:
+        raise ValueError("GPT не повернув заголовок")
+    accent = [i for i in (data.get("accent") or []) if isinstance(i, int) and 0 <= i < len(lines)]
+    if not accent:
+        accent = [len(lines) - 1]
+    return {
+        "tag": str(data.get("tag") or "").strip().upper()[:16],
+        "kicker": str(data.get("kicker") or "").strip().upper()[:34],
+        "lines": lines,
+        "accent": accent,
+    }
+
+
+def _text_w(draw, text, font, spacing=0):
+    return int(draw.textlength(text, font=font)) + spacing * max(0, len(text) - 1)
+
+
+def _draw_spaced(draw, xy, text, font, fill, spacing):
+    x, y = xy
+    for ch in text:
+        draw.text((x, y), ch, font=font, fill=fill)
+        x += draw.textlength(ch, font=font) + spacing
+
+
+def _compose_frame(frame: Image.Image, plan: dict) -> str:
+    """
+    Подкаст-стиль: кадр з відео на весь 9:16, темний градієнт знизу, плашка-тег
+    (червона крапка) зліва зверху, золотий підзаголовок із рискою та великий
+    заголовок (біле + золоте). Увесь текст — у "безпечній зоні" (y 240-1680),
+    щоб лишався видимим і в сітці профілю (обрізка 3:4), і під інтерфейсом.
+    """
+    W, H = COVER_WIDTH, COVER_HEIGHT
+    bg = _fit_cover(frame, W, H).convert("RGBA")
+
+    # Градієнти: знизу (під заголовок) і трохи зверху (під тег)
+    grad = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(grad)
+    g_top = 760
+    for y in range(g_top, H):
+        t = (y - g_top) / (H - g_top)
+        gd.line([(0, y), (W, y)], fill=(0, 0, 0, int(238 * min(1.0, t ** 0.8 * 1.15))))
+    for y in range(0, 340):
+        gd.line([(0, y), (W, y)], fill=(0, 0, 0, int(110 * (1 - y / 340))))
+    bg = Image.alpha_composite(bg, grad)
+
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+
+    # ── Заголовок: авто-розмір, щоб найдовший рядок вліз у ширину ────────────
+    margin_x, max_w = 70, W - 140
+    size = 124
+    while size > 56:
+        font = _load_font(size)
+        if all(_text_w(d, ln, font) <= max_w for ln in plan["lines"]):
+            break
+        size -= 4
+    font = _load_font(size)
+    line_h = int(size * 1.13)
+    block_h = line_h * len(plan["lines"])
+    bottom = 1560
+    top = bottom - block_h
+
+    for i, ln in enumerate(plan["lines"]):
+        y = top + i * line_h
+        sd.text((margin_x + 3, y + 5), ln, font=font, fill=(0, 0, 0, 200))
+        d.text((margin_x, y), ln, font=font, fill=(GOLD if i in plan["accent"] else WHITE) + (255,))
+
+    # ── Підзаголовок (золотий, з рискою під ним) ─────────────────────────────
+    if plan.get("kicker"):
+        kfont = _load_font(40)
+        ky = top - 36 - 56
+        sd.text((margin_x + 2, ky + 3), plan["kicker"], font=kfont, fill=(0, 0, 0, 180))
+        _draw_spaced(d, (margin_x, ky), plan["kicker"], kfont, GOLD + (255,), 3)
+        d.rectangle([margin_x, ky + 58, margin_x + 78, ky + 64], fill=GOLD + (255,))
+
+    # ── Плашка-тег зліва зверху (біла, червона крапка) ───────────────────────
+    if plan.get("tag"):
+        tfont = _load_font(34)
+        tw = _text_w(d, plan["tag"], tfont, 2)
+        x0, y0, pad_x, h = 48, 262, 24, 62
+        w = pad_x + 22 + 14 + tw + pad_x
+        d.rounded_rectangle([x0, y0, x0 + w, y0 + h], radius=h // 2, fill=(255, 255, 255, 245))
+        d.ellipse([x0 + pad_x, y0 + h // 2 - 11, x0 + pad_x + 22, y0 + h // 2 + 11], fill=RED + (255,))
+        _draw_spaced(d, (x0 + pad_x + 36, y0 + 11), plan["tag"], tfont, (15, 15, 15, 255), 2)
+
+    shadow = shadow.filter(ImageFilter.GaussianBlur(7))
+    bg = Image.alpha_composite(bg, shadow)
+    bg = Image.alpha_composite(bg, layer)
+
+    if os.path.exists(LOGO_PATH):
+        try:
+            logo = _resize_logo(Image.open(LOGO_PATH).convert("RGBA"), 170)
+            bg.paste(logo, (margin_x, 1600), mask=logo)
+        except Exception as e:
+            logger.warning(f"Не вдалось завантажити логотип: {e}")
+
+    out = os.path.join(TMP_DIR, f"{uuid.uuid4().hex}_cover_frame.jpg")
     bg.convert("RGB").save(out, "JPEG", quality=95)
     return out
 
